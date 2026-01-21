@@ -1,370 +1,242 @@
 ############################################################
-# Polar Bear Behavioural Response Re-analysis (ESR revision)
-# Workflow: unified (primary) binary model + optional reaction-type model
-# Author: <your name>
-# Data: PBResponse_Data (CSV or Excel) in working directory
+# PB behavioural response re-analysis (ESR revision)
+# Unified modelling workflow (binary primary model + optional type model)
+# Data file: PBResponse_Data.csv OR PBResponse_Data.xlsx (in working dir)
 ############################################################
+# PB behavioural response: streamlined, candidate-set workflow
+# (matches reviewer asks: unified model, simultaneous predictors, AICc candidate set,
+# optional hurdle/type model add-on)
 
-## 0) Housekeeping ------------------------------------------------------------
-rm(list = ls())
+# ---- Packages ----
+# Suggestion: don't install packages inside the analysis script.
+# If needed, install once manually or use renv.
+library(tidyverse)
+library(janitor)
+library(splines)
+library(MuMIn)
+library(performance)
+library(DHARMa)
+library(pROC)
+library(scales)
+
 set.seed(123)
 
-## 1) Packages (install + load) -----------------------------------------------
-pkgs <- c(
-  "tidyverse",   # dplyr, ggplot2, tidyr, purrr, readr, tibble, stringr, forcats
-  "janitor",     # clean_names()
-  "lubridate",   # date handling
-  "broom",       # tidy model outputs
-  "splines",     # ns()
-  "MuMIn",       # AICc model selection + model averaging
-  "performance", # model checks
-  "DHARMa",      # residual diagnostics
-  "pROC",        # AUC
-  "yardstick",   # metrics (tidy)
-  "patchwork",   # combine plots
-  "nnet"         # multinomial (optional)
-)
+# ---- 1) Read + compact modelling table ----
+data_path <- "PBResponse_Data.csv"  # adjust if needed
 
-to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
-if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
-
-invisible(lapply(pkgs, library, character.only = TRUE))
-
-## 2) Read data ---------------------------------------------------------------
-# Expect either PBResponse_Data.csv OR PBResponse_Data.xlsx (adjust if needed)
-read_pb_data <- function(base_name = "PBResponse_Data") {
-  csv_path  <- paste0(base_name, ".csv")
-  xlsx_path <- paste0(base_name, ".xlsx")
-  
-  if (file.exists(csv_path)) {
-    readr::read_csv(csv_path, show_col_types = FALSE)
-  } else if (file.exists(xlsx_path)) {
-    # readxl is not in pkgs by default; install/load if needed
-    if (!"readxl" %in% installed.packages()[, "Package"]) install.packages("readxl")
-    library(readxl)
-    readxl::read_xlsx(xlsx_path)
-  } else if (file.exists(base_name)) {
-    # if user supplies filename with extension already
-    if (grepl("\\.csv$", base_name, ignore.case = TRUE)) {
-      readr::read_csv(base_name, show_col_types = FALSE)
-    } else if (grepl("\\.xlsx$", base_name, ignore.case = TRUE)) {
-      if (!"readxl" %in% installed.packages()[, "Package"]) install.packages("readxl")
-      library(readxl)
-      readxl::read_xlsx(base_name)
-    } else {
-      stop("Could not detect file type for PBResponse_Data. Use .csv or .xlsx.")
-    }
-  } else {
-    stop("Could not find PBResponse_Data.csv or PBResponse_Data.xlsx in the working directory.")
-  }
-}
-
-pb_raw <- read_pb_data("PBResponse_Data")
-
-## 3) Clean column names + light type coercion --------------------------------
-pb <- pb_raw %>%
-  janitor::clean_names()
-
-# Helper: pick the first column name that exists from a set of candidates
-pick_col <- function(df, candidates) {
-  hit <- candidates[candidates %in% names(df)]
-  if (length(hit) == 0) NA_character_ else hit[1]
-}
-
-# Candidate columns (based on your screenshot + manuscript terms)
-col_confirmed <- pick_col(pb, c("confirmed_pb", "confirm_pb", "confirmed", "pb_confirmed"))
-col_distance1 <- pick_col(pb, c("closest_distance_m", "closest_distance_in_meters", "closest_distance_meters",
-                                "sighting_distance_m", "sighting_distance_meter", "sighting_distance_in_meters",
-                                "distance_m", "distance"))
-col_response  <- pick_col(pb, c("response_y_or_n", "response", "reaction", "behavior_change_response"))
-col_rtype     <- pick_col(pb, c("response_type", "reaction_type", "response_category", "response_cat"))
-col_activity  <- pick_col(pb, c("activity_2", "activity", "activity_type", "encounter_activity"))
-col_season    <- pick_col(pb, c("itr_season_and_or_year", "itr_season", "season"))
-col_year      <- pick_col(pb, c("year"))
-col_groupcomp <- pick_col(pb, c("confirmed_combined_sighting_comp", "group_composition", "sighting_comp"))
-col_platform  <- pick_col(pb, c("survey_method_air_land_sea", "survey_method", "platform", "air_land_sea"))
-col_site      <- pick_col(pb, c("map_site", "site", "grid_id", "map_grid_id"))
-col_operator  <- pick_col(pb, c("unit", "operator", "company", "facility"))
-
-# If the dataset has individual count columns, these may exist:
-col_m_cub <- pick_col(pb, c("m_cub", "m_cubs"))
-col_f_cub <- pick_col(pb, c("f_cub", "f_cubs"))
-col_u_cub <- pick_col(pb, c("u_cub", "u_cubs"))
-
-# Create modelling-friendly columns (intuitive names)
-pb2 <- pb %>%
-  mutate(
-    confirmed_pb = if (!is.na(col_confirmed)) as.character(.data[[col_confirmed]]) else NA_character_,
-    distance_m   = if (!is.na(col_distance1)) suppressWarnings(as.numeric(.data[[col_distance1]])) else NA_real_,
-    response_raw = if (!is.na(col_response))  as.character(.data[[col_response]])  else NA_character_,
-    response_type_raw = if (!is.na(col_rtype)) as.character(.data[[col_rtype]]) else NA_character_,
-    activity_raw = if (!is.na(col_activity))  as.character(.data[[col_activity]]) else NA_character_,
-    season_raw   = if (!is.na(col_season))    as.character(.data[[col_season]])   else NA_character_,
-    year         = if (!is.na(col_year))      suppressWarnings(as.integer(.data[[col_year]])) else NA_integer_,
-    group_raw    = if (!is.na(col_groupcomp)) as.character(.data[[col_groupcomp]]) else NA_character_,
-    platform_raw = if (!is.na(col_platform))  as.character(.data[[col_platform]]) else NA_character_,
-    site_raw     = if (!is.na(col_site))      as.character(.data[[col_site]]) else NA_character_,
-    operator_raw = if (!is.na(col_operator))  as.character(.data[[col_operator]]) else NA_character_
-  )
-
-# Derive: response (binary), response_type (categorical), activity_class (mobile/stationary), group_comp
-pb3 <- pb2 %>%
-  mutate(
-    # Standardise confirmed flag (if present)
-    confirmed_pb = str_to_lower(confirmed_pb),
-    confirmed_pb = case_when(
-      confirmed_pb %in% c("y", "yes", "true", "1") ~ "yes",
-      confirmed_pb %in% c("n", "no", "false", "0") ~ "no",
-      TRUE ~ confirmed_pb
-    ),
+pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  transmute(
+    record_id  = unique_record_id,
+    confirmed  = str_to_upper(str_trim(confirmed_pb)),
+    distance_m = readr::parse_number(closest_distance_meter),
+    response_raw = str_to_lower(str_trim(response)),
+    response_type_raw = str_to_lower(str_trim(behavior_change_response)),
     
-    # Binary response: yes/no
-    response = str_to_lower(response_raw),
+    # activity
+    activity2_raw = str_to_lower(str_trim(activity2)),
+    nearest_activity_raw = str_to_lower(str_trim(nearest_activity)),
+    
+    # covariates
+    season_iow_raw = str_to_upper(str_trim(season_i_ow)),
+    survey_method_raw = str_to_lower(str_trim(survey_method_air_land_sea)),
+    
+    # group composition
+    cub_yn_raw = str_to_upper(str_trim(cub_y_n)),
+    m_cub = suppressWarnings(as.integer(m_cub)),
+    f_cub = suppressWarnings(as.integer(f_cub)),
+    u_cub = suppressWarnings(as.integer(u_cub)),
+    
+    # optional clustering/context (keep if you later decide to use it)
+    year = suppressWarnings(as.integer(year)),
+    unit = unit,
+    site = map_site,
+    grid_id = grid_id
+  ) %>%
+  mutate(
+    confirmed = factor(if_else(confirmed == "Y", "yes", "no"), levels = c("no","yes")),
+    
+    # response: Response / No Response / Not Analyzed
     response = case_when(
-      response %in% c("y", "yes", "1", "true", "response", "reacted") ~ "yes",
-      response %in% c("n", "no", "0", "false", "no response", "no_response") ~ "no",
-      TRUE ~ response
-    ),
-    response = factor(response, levels = c("no", "yes")),
+      response_raw == "response"      ~ "yes",
+      response_raw == "no response"   ~ "no",
+      TRUE                            ~ NA_character_   # "not analyzed", blanks, etc.
+    ) %>% factor(levels = c("no","yes")),
+    response_num = as.integer(response == "yes"),
     
-    # Response type (when response == yes)
-    response_type = str_to_lower(response_type_raw),
-    response_type = str_replace_all(response_type, "\\s+", "_"),
+    # response type: only meaningful if response == "yes"
     response_type = case_when(
-      response_type %in% c("walk", "walk_away") ~ "walk",
-      response_type %in% c("swim", "swim_away") ~ "swim",
-      response_type %in% c("run", "run_away")   ~ "run",
-      TRUE ~ response_type
-    ),
+      response == "yes" & str_detect(response_type_raw, "walk") ~ "walk",
+      response == "yes" & str_detect(response_type_raw, "swim") ~ "swim",
+      response == "yes" & str_detect(response_type_raw, "run")  ~ "run",
+      TRUE                                                      ~ NA_character_
+    ) %>% factor(levels = c("walk","swim","run")),
     
-    # Activity class (mobile vs stationary) from free text
-    activity = str_to_lower(activity_raw),
-    activity = str_replace_all(activity, "\\s+", "_"),
+    # activity class: prefer Activity2, fill missing from Nearest Activity
     activity_class = case_when(
-      str_detect(activity, "air|aircraft|helicopter|plane") ~ "mobile",
-      str_detect(activity, "vehicle|truck|car|atv|snow")    ~ "mobile",
-      str_detect(activity, "vessel|boat|ship")              ~ "mobile",
-      str_detect(activity, "pad|facility|camp|stationary")  ~ "stationary",
+      activity2_raw == "stationary" ~ "stationary",
+      activity2_raw == "mobile"     ~ "mobile",
+      nearest_activity_raw %in% c("pad operations", "pad operations ", "pad operations") ~ "stationary",
+      nearest_activity_raw %in% c("driving","vessel","aircraft") ~ "mobile",
       TRUE ~ NA_character_
-    ),
-    activity_class = factor(activity_class, levels = c("stationary", "mobile")),
+    ) %>% factor(levels = c("stationary","mobile")),
     
-    # Season (try to standardise)
-    season = str_to_lower(season_raw),
+    # season: just I vs OW in this dataset
     season = case_when(
-      str_detect(season, "spring") ~ "spring",
-      str_detect(season, "fall|autumn") ~ "fall",
-      str_detect(season, "summer") ~ "summer",
-      str_detect(season, "winter") ~ "winter",
-      TRUE ~ season
-    ),
-    season = factor(season),
-    
-    # Group composition:
-    # Prefer explicit cub count columns if available, else fallback to group_raw text
-    cub_count = {
-      cc <- rep(NA_real_, nrow(.))
-      if (!is.na(col_m_cub) || !is.na(col_f_cub) || !is.na(col_u_cub)) {
-        m <- if (!is.na(col_m_cub)) suppressWarnings(as.numeric(.data[[col_m_cub]])) else 0
-        f <- if (!is.na(col_f_cub)) suppressWarnings(as.numeric(.data[[col_f_cub]])) else 0
-        u <- if (!is.na(col_u_cub)) suppressWarnings(as.numeric(.data[[col_u_cub]])) else 0
-        cc <- m + f + u
-      }
-      cc
-    },
-    group_comp = case_when(
-      !is.na(cub_count) & cub_count > 0 ~ "female_with_cubs",
-      !is.na(cub_count) & cub_count == 0 ~ "no_cubs",
+      season_iow_raw == "I"  ~ "ice",
+      season_iow_raw == "OW" ~ "open_water",
       TRUE ~ NA_character_
-    ),
-    group_comp = if_else(
-      is.na(group_comp) & !is.na(group_raw) & str_detect(str_to_lower(group_raw), "cub"),
-      "female_with_cubs",
-      group_comp
-    ),
-    group_comp = if_else(
-      is.na(group_comp) & !is.na(group_raw),
-      "no_cubs",
-      group_comp
-    ),
-    group_comp = factor(group_comp, levels = c("no_cubs", "female_with_cubs")),
+    ) %>% factor(levels = c("ice","open_water")),
     
-    # Basic IDs for possible clustering
-    site     = factor(site_raw),
-    operator = factor(operator_raw),
-    platform = factor(platform_raw)
+    # cubs: use cub flag OR cub counts (handles inconsistencies)
+    cubs_count = coalesce(m_cub,0L) + coalesce(f_cub,0L) + coalesce(u_cub,0L),
+    cubs_present = (cub_yn_raw == "Y") | (cubs_count > 0),
+    
+    group_comp = if_else(cubs_present, "female_with_cubs", "no_cubs") %>%
+      factor(levels = c("no_cubs","female_with_cubs")),
+    
+    # survey method (mostly Land, but keep if you want to test)
+    survey_method = case_when(
+      survey_method_raw %in% c("land") ~ "Land",
+      survey_method_raw %in% c("sea")  ~ "Sea",
+      survey_method_raw %in% c("air")  ~ "Air",
+      survey_method_raw %in% c("hovercraft") ~ "Hovercraft",
+      TRUE ~ NA_character_
+    ) %>% factor()
   )
 
-## 4) Define analysis dataset --------------------------------------------------
-dat <- pb3 %>%
-  # If confirmed_pb exists, keep confirmed only
-  { if (!all(is.na(.$confirmed_pb))) filter(., confirmed_pb == "yes") else . } %>%
-  filter(!is.na(distance_m), distance_m > 0) %>%
-  filter(!is.na(response)) %>%
-  mutate(
-    dist100 = distance_m / 100,
-    log_dist = log(distance_m),
-    # Optional: truncate very large distances if desired (uncomment if needed)
-    # distance_m = pmin(distance_m, 10000),
-    # dist100 = distance_m / 100,
-    # log_dist = log(distance_m),
-    response_num = as.integer(response == "yes")
+# ---- 2) Analysis dataset (core binary model) ----
+dat <- pb %>%
+  filter(
+    confirmed == "yes",
+    !is.na(distance_m), distance_m > 0,
+    !is.na(response),
+    !is.na(activity_class),
+    !is.na(season),
+    !is.na(group_comp)
   )
 
-# Quick sanity checks
 dat %>%
   summarise(
     n = n(),
     reaction_rate = mean(response == "yes"),
     dist_min = min(distance_m),
     dist_median = median(distance_m),
-    dist_max = max(distance_m),
-    missing_activity_class = mean(is.na(activity_class)),
-    missing_season = mean(is.na(season)),
-    missing_group_comp = mean(is.na(group_comp))
+    dist_max = max(distance_m)
   ) %>% print()
 
-## 5) Decide covariate set (keep realistic for 2-month revision) --------------
-# Recommended "core" covariates (align with reviewer):
-# - distance (main driver)
-# - activity_class (mobile vs stationary)
-# - season
-# - group_comp (cubs vs none)
-#
-# Add platform/operator/site only if needed (and if sample sizes support it).
+# ---- 8) Candidate model set + AICc selection (NO MuMIn) --------------------
 
-dat_core <- dat %>%
-  filter(!is.na(activity_class), !is.na(season), !is.na(group_comp))
-
-## 6) Model set: Binary response (primary, unified inference) -----------------
-# We'll fit three distance functional forms:
-#   A) linear per 100m
-#   B) log(distance)
-#   C) spline (natural cubic) on distance
-#
-# We'll allow a small number of biologically meaningful interactions:
-#   - distance × activity_class
-#   - season × group_comp  (optional)
-#
-# Use AICc model selection + (optional) model averaging.
-
-options(na.action = "na.fail") # required by MuMIn::dredge
-
-# Global models (keep modest—reviewer wants "candidate set", not a fishing expedition)
-m_lin_global <- glm(
-  response ~ dist100 * activity_class + season + group_comp + season:group_comp,
-  data = dat_core,
-  family = binomial()
-)
-
-m_log_global <- glm(
-  response ~ log_dist * activity_class + season + group_comp + season:group_comp,
-  data = dat_core,
-  family = binomial()
-)
-
-m_spline_global <- glm(
-  response ~ ns(distance_m, df = 4) * activity_class + season + group_comp + season:group_comp,
-  data = dat_core,
-  family = binomial()
-)
-
-# Dredge each global model
-dd_lin    <- MuMIn::dredge(m_lin_global, trace = FALSE)
-dd_log    <- MuMIn::dredge(m_log_global, trace = FALSE)
-dd_spline <- MuMIn::dredge(m_spline_global, trace = FALSE)
-
-# Compare best models across distance forms
-best_tbl <- bind_rows(
-  tibble(form = "linear",  best_aicc = min(dd_lin$AICc),    best_df = dd_lin$df[which.min(dd_lin$AICc)]),
-  tibble(form = "log",     best_aicc = min(dd_log$AICc),    best_df = dd_log$df[which.min(dd_log$AICc)]),
-  tibble(form = "spline",  best_aicc = min(dd_spline$AICc), best_df = dd_spline$df[which.min(dd_spline$AICc)])
-) %>% arrange(best_aicc)
-
-print(best_tbl)
-
-# Pick the top-ranked distance form and models within ΔAICc < 2
-pick_models <- function(dd) {
-  mods <- MuMIn::get.models(dd, subset = delta < 2)
-  list(
-    dredge = dd,
-    models = mods,
-    avg = if (length(mods) > 1) MuMIn::model.avg(mods) else NULL,
-    top = mods[[1]]
-  )
+# AICc calculator (works for glm; uses logLik df for k)
+AICc <- function(model) {
+  aic <- AIC(model)
+  k   <- attr(logLik(model), "df")
+  n   <- stats::nobs(model)
+  # Guard against tiny n
+  if (is.na(n) || (n - k - 1) <= 0) return(aic)
+  aic + (2 * k * (k + 1)) / (n - k - 1)
 }
 
-res_lin    <- pick_models(dd_lin)
-res_log    <- pick_models(dd_log)
-res_spline <- pick_models(dd_spline)
+# Build a small, transparent candidate set (reviewer-friendly)
+fit_candidate_set <- function(dat, dist_term) {
+  f_base   <- as.formula(paste0("response ~ ", dist_term))
+  f_act    <- as.formula(paste0("response ~ ", dist_term, " * activity_class"))
+  f_core   <- as.formula(paste0("response ~ ", dist_term, " * activity_class + season * group_comp"))
+  f_survey <- as.formula(paste0("response ~ ", dist_term, " * activity_class + season * group_comp + survey_method"))
+  
+  mods <- list(
+    base = glm(f_base,   data = dat, family = binomial()),
+    act  = glm(f_act,    data = dat, family = binomial()),
+    core = glm(f_core,   data = dat, family = binomial())
+  )
+  
+  # Only include survey_method model if survey_method exists and has >1 level
+  if ("survey_method" %in% names(dat) && nlevels(droplevels(dat$survey_method)) > 1) {
+    mods$survey <- glm(f_survey, data = dat, family = binomial())
+  }
+  
+  mods
+}
 
-# Decide final by the best AICc form
-final_res <- switch(best_tbl$form[1],
-                    "linear" = res_lin,
-                    "log"    = res_log,
-                    "spline" = res_spline
-)
+# Fit distance-form sets
+mods_lin <- fit_candidate_set(dat, "I(distance_m/100)")
+mods_log <- fit_candidate_set(dat, "log(distance_m)")
+mods_spl <- fit_candidate_set(dat, "splines::ns(distance_m, df=4)")
 
-final_model <- final_res$top
+# Combine all models in one named list
+mods_all <- c(
+  purrr::imap(mods_lin, ~ setNames(list(.x), paste0("lin_", .y))),
+  purrr::imap(mods_log, ~ setNames(list(.x), paste0("log_", .y))),
+  purrr::imap(mods_spl, ~ setNames(list(.x), paste0("spl_", .y)))
+) %>% unlist(recursive = FALSE)
+
+# Model selection table
+sel_tbl <- purrr::imap_dfr(mods_all, function(m, nm) {
+  tibble(
+    model = nm,
+    k     = attr(logLik(m), "df"),
+    n     = nobs(m),
+    AIC   = AIC(m),
+    AICc  = AICc(m)
+  )
+}) %>%
+  arrange(AICc) %>%
+  mutate(
+    delta = AICc - min(AICc),
+    weight = exp(-0.5 * delta) / sum(exp(-0.5 * delta))
+  )
+
+print(sel_tbl)
+
+# Pick top model
+final_model <- mods_all[[sel_tbl$model[1]]]
 summary(final_model)
 
-# If there are multiple near-tied models, you can use model averaging
-if (!is.null(final_res$avg)) {
-  cat("\nModel averaging across ΔAICc < 2 models\n")
-  print(summary(final_res$avg))
-}
+# If you want the "ΔAICc < 2" set:
+top_names <- sel_tbl %>% filter(delta < 2) %>% pull(model)
+top_models <- mods_all[top_names]
+top_weights <- sel_tbl %>% filter(delta < 2) %>% pull(weight)
 
-## 7) Model validation / robustness checks ------------------------------------
-# Collinearity, overdispersion, influential points, and DHARMa residual diagnostics
-performance::check_collinearity(final_model) %>% print()
-performance::check_overdispersion(final_model) %>% print()
-performance::check_outliers(final_model) %>% print()
-performance::check_influential(final_model) %>% print()
+cat("\nTop set (ΔAICc < 2):\n")
+print(sel_tbl %>% filter(delta < 2))
 
-# DHARMa residual simulation
+# ---- 4) Diagnostics ----
+print(performance::check_collinearity(final_model))
+print(performance::check_overdispersion(final_model))
+print(performance::check_influential(final_model))
+
 sim <- DHARMa::simulateResiduals(final_model, n = 500)
 plot(sim)
 DHARMa::testDispersion(sim)
-DHARMa::testZeroInflation(sim)   # for binomial, flags issues if excess zeros beyond expectation
+DHARMa::testZeroInflation(sim)
 DHARMa::testOutliers(sim)
 
-# Predictive discrimination: AUC
-dat_core <- dat_core %>%
-  mutate(
-    pred_prob = predict(final_model, type = "response")
-  )
-
-auc <- pROC::roc(response = dat_core$response_num, predictor = dat_core$pred_prob, quiet = TRUE) %>%
-  pROC::auc()
-
+# AUC
+dat <- dat %>% mutate(pred_prob = predict(final_model, type = "response"))
+auc <- pROC::roc(response = dat$response_num, predictor = dat$pred_prob, quiet = TRUE) %>% pROC::auc()
 cat("\nAUC:", as.numeric(auc), "\n")
 
-## 8) Prediction plots (ggplot2 / tidyverse) ----------------------------------
-# Create a smooth distance grid and predict by activity_class (and optionally season/group)
-make_pred_grid <- function(dat, dist_seq = NULL) {
-  if (is.null(dist_seq)) {
-    dist_seq <- seq(
-      from = quantile(dat$distance_m, 0.01, na.rm = TRUE),
-      to   = quantile(dat$distance_m, 0.99, na.rm = TRUE),
-      length.out = 250
-    )
-  }
+# ---- 5) Prediction curve (distance-response) ----
+make_pred_grid <- function(dat, season_ref = "open_water", group_ref = "no_cubs", survey_ref = NULL) {
+  dist_seq <- seq(quantile(dat$distance_m, 0.01), quantile(dat$distance_m, 0.99), length.out = 250)
   
-  expand_grid(
+  g <- tidyr::expand_grid(
     distance_m = dist_seq,
     activity_class = levels(dat$activity_class),
-    season = levels(dat$season)[1],         # choose a reference level (can expand if you want)
-    group_comp = levels(dat$group_comp)[1]  # choose a reference level
-  ) %>%
-    mutate(
-      dist100 = distance_m / 100,
-      log_dist = log(distance_m)
-    )
+    season = factor(season_ref, levels = levels(dat$season)),
+    group_comp = factor(group_ref, levels = levels(dat$group_comp))
+  )
+  
+  # include survey_method only if the model uses it
+  if ("survey_method" %in% all.vars(formula(final_model))) {
+    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
+    g <- g %>% mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
+  }
+  
+  g
 }
 
-pred_grid <- make_pred_grid(dat_core)
-
-# Predict on link scale for confidence intervals
+pred_grid <- make_pred_grid(dat)
 pred_link <- predict(final_model, newdata = pred_grid, type = "link", se.fit = TRUE)
 
 pred_df <- pred_grid %>%
@@ -376,152 +248,218 @@ pred_df <- pred_grid %>%
     hi   = plogis(link + 1.96 * se)
   )
 
-p_curve <- ggplot(pred_df, aes(x = distance_m, y = prob, colour = activity_class, fill = activity_class)) +
+p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill = activity_class)) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
   geom_line(linewidth = 1) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
     x = "Distance (m)",
     y = "Predicted probability of behavioural reaction",
-    colour = "Activity class",
-    fill = "Activity class",
     title = "Distance–response curve (binary reaction model)",
-    subtitle = "Shaded bands: 95% confidence intervals (on link scale)"
+    subtitle = "95% CI ribbons; other covariates held at reference levels"
   ) +
   theme_minimal()
 
-p_curve
+print(p_curve)
 
-# Optional: add points (binned) for visual calibration
-binned <- dat_core %>%
-  mutate(dist_bin = cut(distance_m, breaks = quantile(distance_m, probs = seq(0, 1, 0.1), na.rm = TRUE), include.lowest = TRUE)) %>%
-  group_by(activity_class, dist_bin) %>%
-  summarise(
-    dist_mid = median(distance_m, na.rm = TRUE),
-    obs_rate = mean(response == "yes"),
-    n = n(),
-    .groups = "drop"
+# ---- 6) Management outputs table (805 m and 1610 m) ----
+# These are explicitly mentioned in your proposal as likely reporting distances.
+key_dists <- c(805, 1610)
+
+pred_at_distance <- function(d) {
+  nd <- make_pred_grid(dat) %>%
+    slice(1) %>%                         # take a template row
+    mutate(distance_m = d)
+  
+  pr <- predict(final_model, newdata = nd, type = "link", se.fit = TRUE)
+  tibble(
+    distance_m = d,
+    prob = plogis(pr$fit),
+    lo   = plogis(pr$fit - 1.96 * pr$se.fit),
+    hi   = plogis(pr$fit + 1.96 * pr$se.fit)
   )
-
-p_curve_binned <- p_curve +
-  geom_point(
-    data = binned,
-    aes(x = dist_mid, y = obs_rate, size = n, colour = activity_class),
-    alpha = 0.6,
-    inherit.aes = FALSE
-  ) +
-  scale_size_continuous(name = "N (bin)")
-
-p_curve_binned
-
-## 9) Management-style thresholds (distance at target probabilities) ----------
-# Works for any model form by using prediction + root finding.
-# Note: requires monotonic-ish relationship; if spline gets wiggly, keep df small.
-predict_prob_at <- function(model, activity_class, season, group_comp, distance_m) {
-  nd <- tibble(
-    distance_m = distance_m,
-    dist100 = distance_m / 100,
-    log_dist = log(distance_m),
-    activity_class = factor(activity_class, levels = levels(dat_core$activity_class)),
-    season = factor(season, levels = levels(dat_core$season)),
-    group_comp = factor(group_comp, levels = levels(dat_core$group_comp))
-  )
-  as.numeric(predict(model, newdata = nd, type = "response"))
 }
 
-find_distance_for_p <- function(model, target_p, activity_class, season, group_comp,
-                                lower = 50, upper = 10000) {
-  f <- function(d) predict_prob_at(model, activity_class, season, group_comp, d) - target_p
-  # Ensure the function crosses 0 in [lower, upper]
-  if (sign(f(lower)) == sign(f(upper))) return(NA_real_)
-  uniroot(f, lower = lower, upper = upper)$root
-}
+mgmt_tbl <- map_dfr(key_dists, pred_at_distance) %>%
+  mutate(across(c(prob, lo, hi), ~ scales::percent(.x, accuracy = 0.1)))
 
-targets <- c(0.01, 0.05, 0.10) # 1%, 5%, 10% reaction probabilities (edit as needed)
-ref_season <- levels(dat_core$season)[1]
-ref_group  <- levels(dat_core$group_comp)[1]
+print(mgmt_tbl)
 
-thresholds <- expand_grid(
-  activity_class = levels(dat_core$activity_class),
-  target_p = targets
-) %>%
-  mutate(
-    distance_m = map2_dbl(activity_class, target_p,
-                          ~ find_distance_for_p(final_model, .y, .x, ref_season, ref_group)
-    )
-  )
-
-print(thresholds)
-
-## 10) OPTIONAL: Reaction type model (if counts support it) -------------------
-# If you want to address the reviewer’s “consider response type”:
-# You can model categories (none/walk/swim/run) with multinomial regression.
-# This can get fragile when some categories are rare or interactions are added.
-#
-# Minimal approach: use a multinomial with a small covariate set and no huge interactions.
-#
-# Uncomment to run.
-
-# dat_multi <- dat_core %>%
-#   mutate(
-#     response_cat = case_when(
-#       response == "no" ~ "none",
-#       response == "yes" & response_type %in% c("walk", "swim", "run") ~ response_type,
-#       TRUE ~ "other"
-#     ),
-#     response_cat = factor(response_cat)
-#   ) %>%
-#   filter(response_cat %in% c("none", "walk", "swim", "run")) %>%
-#   droplevels()
-#
-# # Simple multinomial model (nnet::multinom)
-# m_multinom <- nnet::multinom(
-#   response_cat ~ dist100 + activity_class + season + group_comp,
-#   data = dat_multi,
-#   trace = FALSE
-# )
-#
-# summary(m_multinom)
-# AIC(m_multinom)
-#
-# # Predicted class probabilities vs distance (for one season/group reference)
-# pred_grid2 <- make_pred_grid(dat_multi) %>%
-#   mutate(dist100 = distance_m / 100)
-#
-# probs <- predict(m_multinom, newdata = pred_grid2, type = "probs")
-# probs_df <- bind_cols(pred_grid2, as_tibble(probs)) %>%
-#   pivot_longer(cols = -c(distance_m, activity_class, season, group_comp, dist100, log_dist),
-#                names_to = "class", values_to = "prob")
-#
-# p_multi <- ggplot(probs_df, aes(distance_m, prob, colour = class)) +
-#   geom_line(linewidth = 1) +
-#   facet_wrap(~ activity_class) +
-#   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-#   labs(
-#     x = "Distance (m)",
-#     y = "Predicted probability",
-#     colour = "Response category",
-#     title = "Multinomial predicted response type vs distance"
-#   ) +
-#   theme_minimal()
-#
-# p_multi
-
-## 11) Outputs (tables + plots) ----------------------------------------------
+# ---- 7) Save outputs ----
 dir.create("results", showWarnings = FALSE)
-
-# Model selection tables
-write_csv(as_tibble(dd_lin),    "results/model_selection_linear.csv")
-write_csv(as_tibble(dd_log),    "results/model_selection_log.csv")
-write_csv(as_tibble(dd_spline), "results/model_selection_spline.csv")
-write_csv(best_tbl,             "results/best_distance_form_compare.csv")
-write_csv(thresholds,           "results/threshold_distances.csv")
-
-# Save plots
+write_csv(mgmt_tbl, "results/management_probs_805_1610.csv")
+write_csv(as_tibble(sel), "results/model_selection_candidate_set.csv")
 ggsave("results/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
-ggsave("results/pred_curve_binned.png", p_curve_binned, width = 9, height = 5, dpi = 300)
-
-# Session info for reproducibility
 writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
 
 cat("\nDone. Results saved in ./results\n")
+
+# ---- OPTIONAL: Hurdle-style “response type” add-on (Reviewer 1 request) ----
+# (1) binary model above: react vs not
+# (2) conditional multinomial among reactors only (walk/swim/run)
+# This is the lightest-weight way to address the “type” critique without overbuilding.
+#
+# library(nnet)
+# dat_type <- dat %>% filter(response == "yes", !is.na(response_type))
+# type_mod <- nnet::multinom(response_type ~ log(distance_m) + activity_class + season + group_comp,
+#                            data = dat_type, trace = FALSE)
+# summary(type_mod)
+
+
+# ---- 6) Distance thresholds for target reaction probabilities (with uncertainty) ----
+# Finds the distance where predicted P(reaction) drops to a target (e.g., 0.05, 0.10)
+# Uses parametric bootstrap on coefficients (MVN approx) to get 95% CI.
+
+# Helper: build a 1-row newdata template with your chosen reference settings
+make_newdata_template <- function(dat, activity_class_value,
+                                  season_ref = "open_water",
+                                  group_ref  = "no_cubs",
+                                  survey_ref = NULL) {
+  
+  nd <- tibble(
+    distance_m = median(dat$distance_m, na.rm = TRUE),
+    activity_class = factor(activity_class_value, levels = levels(dat$activity_class)),
+    season = factor(season_ref, levels = levels(dat$season)),
+    group_comp = factor(group_ref, levels = levels(dat$group_comp))
+  )
+  
+  # Include survey_method only if it exists in dat (and possibly in model)
+  if ("survey_method" %in% names(dat)) {
+    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
+    nd <- nd %>% mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
+  }
+  
+  nd
+}
+
+# Core function: threshold distance given a coefficient vector beta
+threshold_distance_from_beta <- function(model, nd_template, target_prob,
+                                         dist_grid, beta_vec) {
+  
+  # Build model matrix for each distance on the grid
+  nd <- nd_template[rep(1, length(dist_grid)), , drop = FALSE]
+  nd$distance_m <- dist_grid
+  
+  X <- model.matrix(stats::delete.response(stats::terms(model)), nd)
+  eta <- drop(X %*% beta_vec)
+  p   <- plogis(eta)
+  
+  # We want the FIRST distance where p <= target_prob
+  # If already below at the minimum grid distance, return that minimum
+  if (p[1] <= target_prob) return(dist_grid[1])
+  
+  idx <- which(p <= target_prob)[1]
+  if (is.na(idx) || idx == 1) return(NA_real_)  # never crosses within grid
+  
+  # Bracket around the crossing and refine using uniroot on the link scale
+  d1 <- dist_grid[idx - 1]
+  d2 <- dist_grid[idx]
+  
+  f <- function(d) {
+    nd1 <- nd_template
+    nd1$distance_m <- d
+    X1 <- model.matrix(stats::delete.response(stats::terms(model)), nd1)
+    plogis(drop(X1 %*% beta_vec)) - target_prob
+  }
+  
+  # Should bracket a root; uniroot refines it
+  out <- tryCatch(
+    stats::uniroot(f, lower = d1, upper = d2)$root,
+    error = function(e) NA_real_
+  )
+  out
+}
+
+# Wrapper: point estimate + bootstrap CI for each activity_class and target
+estimate_distance_thresholds <- function(model, dat,
+                                         targets = c(0.05, 0.10),
+                                         season_ref = "open_water",
+                                         group_ref  = "no_cubs",
+                                         survey_ref = NULL,
+                                         B = 1000,
+                                         grid_n = 2000,
+                                         grid_max_mult = 5) {
+  
+  # Distance grid for searching the crossing (extend beyond observed max a bit)
+  min_d <- max(min(dat$distance_m, na.rm = TRUE), 1e-3)
+  max_d <- max(dat$distance_m, na.rm = TRUE) * grid_max_mult
+  dist_grid <- seq(min_d, max_d, length.out = grid_n)
+  
+  beta_hat <- coef(model)
+  V <- vcov(model)
+  
+  # Precompute Cholesky for MVN draws; handle near-singular vcov gracefully
+  cholV <- tryCatch(chol(V), error = function(e) NULL)
+  
+  draw_beta <- function() {
+    if (is.null(cholV)) return(beta_hat) # fallback: no uncertainty if vcov fails
+    z <- rnorm(length(beta_hat))
+    beta_hat + drop(t(cholV) %*% z)
+  }
+  
+  res <- tidyr::expand_grid(
+    activity_class = levels(dat$activity_class),
+    target_prob = targets
+  ) %>%
+    mutate(
+      # point estimate using beta_hat
+      estimate_m = map2_dbl(activity_class, target_prob, ~{
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        threshold_distance_from_beta(model, nd0, .y, dist_grid, beta_hat)
+      }),
+      
+      # bootstrap draws
+      boot = map2(activity_class, target_prob, ~{
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        replicate(B, {
+          b <- draw_beta()
+          threshold_distance_from_beta(model, nd0, .y, dist_grid, b)
+        })
+      }),
+      
+      ci_lo_m = map_dbl(boot, ~ quantile(.x, 0.025, na.rm = TRUE)),
+      ci_hi_m = map_dbl(boot, ~ quantile(.x, 0.975, na.rm = TRUE))
+    ) %>%
+    select(-boot) %>%
+    mutate(
+      estimate_km = estimate_m / 1000,
+      ci_lo_km    = ci_lo_m / 1000,
+      ci_hi_km    = ci_hi_m / 1000
+    )
+  
+  res
+}
+
+# Run it (choose reference settings to match your reporting scenario)
+# You can change season_ref/group_ref/survey_ref to whatever you want held constant.
+dist_thresh_tbl <- estimate_distance_thresholds(
+  model = final_model,
+  dat   = dat,
+  targets = c(0.05, 0.10),
+  season_ref = "open_water",
+  group_ref  = "no_cubs",
+  survey_ref = if ("survey_method" %in% names(dat)) levels(dat$survey_method)[1] else NULL,
+  B = 1000
+)
+
+print(dist_thresh_tbl)
+
+# Pretty version for reporting
+dist_thresh_pretty <- dist_thresh_tbl %>%
+  mutate(
+    target = scales::percent(target_prob, accuracy = 1),
+    estimate_m = round(estimate_m),
+    ci_lo_m    = round(ci_lo_m),
+    ci_hi_m    = round(ci_hi_m),
+    estimate_km = round(estimate_km, 2),
+    ci_lo_km    = round(ci_lo_km, 2),
+    ci_hi_km    = round(ci_hi_km, 2)
+  ) %>%
+  select(activity_class, target, estimate_m, ci_lo_m, ci_hi_m, estimate_km, ci_lo_km, ci_hi_km)
+
+print(dist_thresh_pretty)
+
+
+write_csv(dist_thresh_tbl,    "results/distance_thresholds_raw.csv")
+write_csv(dist_thresh_pretty, "results/distance_thresholds_pretty.csv")
+
