@@ -125,7 +125,7 @@ dat %>%
     dist_max = max(distance_m)
   ) %>% print()
 
-# ---- 8) Candidate model set + AICc selection (NO MuMIn) --------------------
+# ---- 3) Candidate model set + AICc selection (NO MuMIn) --------------------
 
 # AICc calculator (works for glm; uses logLik df for k)
 AICc <- function(model) {
