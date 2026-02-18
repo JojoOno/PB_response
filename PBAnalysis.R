@@ -324,6 +324,163 @@ mgmt_tbl <- map_dfr(key_dists, pred_at_distance) %>%
 
 print(mgmt_tbl)
 
+# ---- 6) Distance thresholds for target reaction probabilities (with uncertainty) ----
+# Finds the distance where predicted P(reaction) drops to a target (e.g., 0.05, 0.10)
+# Uses parametric bootstrap on coefficients (MVN approx) to get 95% CI.
+
+# Helper: build a 1-row newdata template with your chosen reference settings
+make_newdata_template <- function(dat, activity_class_value,
+                                  season_ref = "open_water",
+                                  group_ref  = "no_cubs",
+                                  survey_ref = NULL) {
+  
+  nd <- tibble(
+    distance_m = median(dat$distance_m, na.rm = TRUE),
+    activity_class = factor(activity_class_value, levels = levels(dat$activity_class)),
+    season = factor(season_ref, levels = levels(dat$season)),
+    group_comp = factor(group_ref, levels = levels(dat$group_comp))
+  )
+  
+  # Include survey_method only if it exists in dat (and possibly in model)
+  if ("survey_method" %in% names(dat)) {
+    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
+    nd <- nd %>% mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
+  }
+  
+  nd
+}
+
+# Core function: threshold distance given a coefficient vector beta
+threshold_distance_from_beta <- function(model, nd_template, target_prob,
+                                         dist_grid, beta_vec) {
+  
+  # Build model matrix for each distance on the grid
+  nd <- nd_template[rep(1, length(dist_grid)), , drop = FALSE]
+  nd$distance_m <- dist_grid
+  
+  X <- model.matrix(stats::delete.response(stats::terms(model)), nd)
+  eta <- drop(X %*% beta_vec)
+  p   <- plogis(eta)
+  
+  # We want the FIRST distance where p <= target_prob
+  # If already below at the minimum grid distance, return that minimum
+  if (p[1] <= target_prob) return(dist_grid[1])
+  
+  idx <- which(p <= target_prob)[1]
+  if (is.na(idx) || idx == 1) return(NA_real_)  # never crosses within grid
+  
+  # Bracket around the crossing and refine using uniroot on the link scale
+  d1 <- dist_grid[idx - 1]
+  d2 <- dist_grid[idx]
+  
+  f <- function(d) {
+    nd1 <- nd_template
+    nd1$distance_m <- d
+    X1 <- model.matrix(stats::delete.response(stats::terms(model)), nd1)
+    plogis(drop(X1 %*% beta_vec)) - target_prob
+  }
+  
+  # Should bracket a root; uniroot refines it
+  out <- tryCatch(
+    stats::uniroot(f, lower = d1, upper = d2)$root,
+    error = function(e) NA_real_
+  )
+  out
+}
+
+# Wrapper: point estimate + bootstrap CI for each activity_class and target
+estimate_distance_thresholds <- function(model, dat,
+                                         targets = c(0.05, 0.10),
+                                         season_ref = "open_water",
+                                         group_ref  = "no_cubs",
+                                         survey_ref = NULL,
+                                         B = 1000,
+                                         grid_n = 2000,
+                                         grid_max_mult = 5) {
+  
+  # Distance grid for searching the crossing (extend beyond observed max a bit)
+  min_d <- max(min(dat$distance_m, na.rm = TRUE), 1e-3)
+  max_d <- max(dat$distance_m, na.rm = TRUE) * grid_max_mult
+  dist_grid <- seq(min_d, max_d, length.out = grid_n)
+  
+  beta_hat <- coef(model)
+  V <- vcov(model)
+  
+  # Precompute Cholesky for MVN draws; handle near-singular vcov gracefully
+  cholV <- tryCatch(chol(V), error = function(e) NULL)
+  
+  draw_beta <- function() {
+    if (is.null(cholV)) return(beta_hat) # fallback: no uncertainty if vcov fails
+    z <- rnorm(length(beta_hat))
+    beta_hat + drop(t(cholV) %*% z)
+  }
+  
+  res <- tidyr::expand_grid(
+    activity_class = levels(dat$activity_class),
+    target_prob = targets
+  ) %>%
+    mutate(
+      # point estimate using beta_hat
+      estimate_m = map2_dbl(activity_class, target_prob, ~{
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        threshold_distance_from_beta(model, nd0, .y, dist_grid, beta_hat)
+      }),
+      
+      # bootstrap draws
+      boot = map2(activity_class, target_prob, ~{
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        replicate(B, {
+          b <- draw_beta()
+          threshold_distance_from_beta(model, nd0, .y, dist_grid, b)
+        })
+      }),
+      
+      ci_lo_m = map_dbl(boot, ~ quantile(.x, 0.025, na.rm = TRUE)),
+      ci_hi_m = map_dbl(boot, ~ quantile(.x, 0.975, na.rm = TRUE))
+    ) %>%
+    select(-boot) %>%
+    mutate(
+      estimate_km = estimate_m / 1000,
+      ci_lo_km    = ci_lo_m / 1000,
+      ci_hi_km    = ci_hi_m / 1000
+    )
+  
+  res
+}
+
+# Run it (choose reference settings to match your reporting scenario)
+# You can change season_ref/group_ref/survey_ref to whatever you want held constant.
+dist_thresh_tbl <- estimate_distance_thresholds(
+  model = final_model,
+  dat   = dat,
+  targets = c(0.05, 0.10),
+  season_ref = "open_water",
+  group_ref  = "no_cubs",
+  survey_ref = if ("survey_method" %in% names(dat)) levels(dat$survey_method)[1] else NULL,
+  B = 1000
+)
+
+print(dist_thresh_tbl)
+
+# Pretty version for reporting
+dist_thresh_pretty <- dist_thresh_tbl %>%
+  mutate(
+    target = scales::percent(target_prob, accuracy = 1),
+    estimate_m = round(estimate_m),
+    ci_lo_m    = round(ci_lo_m),
+    ci_hi_m    = round(ci_hi_m),
+    estimate_km = round(estimate_km, 2),
+    ci_lo_km    = round(ci_lo_km, 2),
+    ci_hi_km    = round(ci_hi_km, 2)
+  ) %>%
+  select(activity_class, target, estimate_m, ci_lo_m, ci_hi_m, estimate_km, ci_lo_km, ci_hi_km)
+
+print(dist_thresh_pretty)
+
+
+write_csv(dist_thresh_tbl,    "results/distance_thresholds_raw.csv")
+write_csv(dist_thresh_pretty, "results/distance_thresholds_pretty.csv")
+
 # ---- 7) Save outputs ----
 dir.create("results", showWarnings = FALSE)
 write_csv(mgmt_tbl, "results/management_probs_805_1610.csv")
@@ -331,7 +488,258 @@ write_csv(as_tibble(sel), "results/model_selection_candidate_set.csv")
 ggsave("results/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
 writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
 
-cat("\nDone. Results saved in ./results\n")
 
+# ---- PLAYING WITH PLOTS ----
+# ---- Calibration Plot ----
+
+n_bins <- 10
+
+cal_df <- dat %>%
+  mutate(
+    bin = cut(pred_prob, breaks = n_bins, include.lowest = TRUE)
+  ) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_predicted = mean(pred_prob),
+    mean_observed  = mean(response_num),
+    n              = n(),
+    se             = sqrt(mean_observed * (1 - mean_observed) / n)
+  )
+
+p_cal <- ggplot(cal_df, aes(x = mean_predicted, y = mean_observed)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50", linewidth = 0.7) +
+  geom_errorbar(aes(ymin = mean_observed - 1.96 * se,
+                    ymax = mean_observed + 1.96 * se),
+                width = 0.01, colour = "#2c7bb6") +
+  geom_point(aes(size = n), colour = "#2c7bb6", alpha = 0.8) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_size_continuous(name = "N observations", range = c(2, 8)) +
+  labs(
+    x        = "Mean predicted probability",
+    y        = "Observed reaction rate",
+    title    = "Model calibration plot",
+    subtitle = "Points sized by number of observations per bin; error bars show 95% CI on observed rate"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+print(p_cal)
+
+
+# ---- Covariate Effect Plots ----
+
+predict_marginal <- function(newdata) {
+  pr <- predict(final_model, newdata = newdata, type = "link", se.fit = TRUE)
+  newdata %>%
+    mutate(
+      prob = plogis(pr$fit),
+      lo   = plogis(pr$fit - 1.96 * pr$se.fit),
+      hi   = plogis(pr$fit + 1.96 * pr$se.fit)
+    )
+}
+
+median_dist <- median(dat$distance_m)
+ref_survey  <- levels(dat$survey_method)[1]
+
+act_df <- tibble(
+  distance_m     = median_dist,
+  activity_class = levels(dat$activity_class) %>% factor(levels = levels(dat$activity_class)),
+  season         = factor("open_water",  levels = levels(dat$season)),
+  group_comp     = factor("no_cubs",     levels = levels(dat$group_comp)),
+  survey_method  = factor(ref_survey,    levels = levels(dat$survey_method))
+) %>%
+  predict_marginal() %>%
+  mutate(covariate = "Activity class", level = as.character(activity_class))
+
+season_df <- tibble(
+  distance_m     = median_dist,
+  activity_class = factor("stationary", levels = levels(dat$activity_class)),
+  season         = levels(dat$season) %>% factor(levels = levels(dat$season)),
+  group_comp     = factor("no_cubs",    levels = levels(dat$group_comp)),
+  survey_method  = factor(ref_survey,   levels = levels(dat$survey_method))
+) %>%
+  predict_marginal() %>%
+  mutate(covariate = "Season", level = as.character(season))
+
+group_df <- tibble(
+  distance_m     = median_dist,
+  activity_class = factor("stationary", levels = levels(dat$activity_class)),
+  season         = factor("open_water", levels = levels(dat$season)),
+  group_comp     = levels(dat$group_comp) %>% factor(levels = levels(dat$group_comp)),
+  survey_method  = factor(ref_survey,   levels = levels(dat$survey_method))
+) %>%
+  predict_marginal() %>%
+  mutate(covariate = "Group composition", level = as.character(group_comp))
+
+survey_df <- tibble(
+  distance_m     = median_dist,
+  activity_class = factor("stationary", levels = levels(dat$activity_class)),
+  season         = factor("open_water", levels = levels(dat$season)),
+  group_comp     = factor("no_cubs",    levels = levels(dat$group_comp)),
+  survey_method  = levels(dat$survey_method) %>% factor(levels = levels(dat$survey_method))
+) %>%
+  predict_marginal() %>%
+  mutate(covariate = "Survey method", level = as.character(survey_method))
+
+p_effects <- bind_rows(act_df, season_df, group_df, survey_df) %>%
+  mutate(covariate = factor(covariate,
+                            levels = c("Activity class", "Season",
+                                       "Group composition", "Survey method"))) %>%
+  ggplot(aes(x = level, y = prob)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                width = 0.15, colour = "#2c7bb6", linewidth = 0.8) +
+  geom_point(size = 3, colour = "#2c7bb6") +
+  facet_wrap(~ covariate, scales = "free_x", nrow = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x        = NULL,
+    y        = "Predicted probability of reaction",
+    title    = "Marginal covariate effects",
+    subtitle = paste0("Distance held at median (", median_dist,
+                      " m); other covariates at reference levels")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text         = element_text(face = "bold"),
+    plot.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(angle = 25, hjust = 1)
+  )
+
+print(p_effects)
+
+
+# ---- 2x2 Season x Group Composition Panel ----
+
+panel_grid <- tidyr::expand_grid(
+  distance_m     = seq(quantile(dat$distance_m, 0.01),
+                       quantile(dat$distance_m, 0.99),
+                       length.out = 200),
+  activity_class = levels(dat$activity_class),
+  season         = levels(dat$season),
+  group_comp     = levels(dat$group_comp)
+) %>%
+  mutate(
+    survey_method = factor(levels(dat$survey_method)[1],
+                           levels = levels(dat$survey_method))
+  )
+
+panel_link <- predict(final_model, newdata = panel_grid,
+                      type = "link", se.fit = TRUE)
+
+panel_df <- panel_grid %>%
+  mutate(
+    prob         = plogis(panel_link$fit),
+    lo           = plogis(panel_link$fit - 1.96 * panel_link$se.fit),
+    hi           = plogis(panel_link$fit + 1.96 * panel_link$se.fit),
+    season_label = if_else(season == "ice", "Ice", "Open water"),
+    group_label  = if_else(group_comp == "no_cubs", "No cubs", "Female with cubs")
+  )
+
+p_panel <- ggplot(panel_df, aes(x = distance_m, y = prob,
+                                colour = activity_class,
+                                fill   = activity_class)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(group_label ~ season_label) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x        = "Distance (m)",
+    y        = "Predicted probability of reaction",
+    colour   = "Activity class",
+    fill     = "Activity class",
+    title    = "Distance-response curves by season and group composition",
+    subtitle = "Ribbons show 95% CI; survey method held at reference level"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    plot.title       = element_text(face = "bold")
+  )
+
+print(p_panel)
+
+
+# ---- Bootstrap Threshold Distribution Plot ----
+
+# Re-run the bootstrap keeping the raw draws
+# (if you still have dist_thresh_tbl from earlier you can skip re-running
+#  the threshold estimation and just re-extract the draws below)
+
+boot_draws <- tidyr::expand_grid(
+  activity_class = levels(dat$activity_class),
+  target_prob    = c(0.05, 0.10)
+) %>%
+  mutate(
+    draws = map2(activity_class, target_prob, ~ {
+      nd0 <- make_newdata_template(dat, .x,
+                                   season_ref = "open_water",
+                                   group_ref  = "no_cubs",
+                                   survey_ref = levels(dat$survey_method)[1])
+      
+      min_d     <- max(min(dat$distance_m, na.rm = TRUE), 1e-3)
+      max_d     <- max(dat$distance_m, na.rm = TRUE) * 5
+      dist_grid <- seq(min_d, max_d, length.out = 2000)
+      
+      beta_hat <- coef(final_model)
+      V        <- vcov(final_model)
+      cholV    <- tryCatch(chol(V), error = function(e) NULL)
+      
+      draw_beta <- function() {
+        if (is.null(cholV)) return(beta_hat)
+        beta_hat + drop(t(cholV) %*% rnorm(length(beta_hat)))
+      }
+      
+      replicate(1000, {
+        threshold_distance_from_beta(final_model, nd0, .y, dist_grid, draw_beta())
+      })
+    })
+  )
+
+boot_long <- boot_draws %>%
+  mutate(
+    target_label   = paste0("Target: ", scales::percent(target_prob, accuracy = 1)),
+    activity_label = paste0("Activity: ", activity_class)
+  ) %>%
+  tidyr::unnest_longer(draws) %>%
+  filter(!is.na(draws), draws < max(dat$distance_m) * 5)
+
+p_boot <- ggplot(boot_long, aes(x = draws / 1000, fill = activity_class)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 60, alpha = 0.7, colour = NA,
+                 position = "identity") +
+  geom_vline(
+    data = boot_long %>%
+      group_by(activity_class, target_label) %>%
+      summarise(median_km = median(draws / 1000, na.rm = TRUE), .groups = "drop"),
+    aes(xintercept = median_km, colour = activity_class),
+    linetype = "dashed", linewidth = 0.8
+  ) +
+  facet_grid(activity_class ~ target_label, scales = "free_x") +
+  scale_x_continuous(name = "Threshold distance (km)") +
+  scale_y_continuous(name = "Density") +
+  labs(
+    title    = "Bootstrap distribution of distance thresholds",
+    subtitle = "Dashed lines show median; distributions reflect full parametric uncertainty in model coefficients"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position    = "none",
+    panel.grid.minor   = element_blank(),
+    strip.text         = element_text(face = "bold"),
+    plot.title         = element_text(face = "bold")
+  )
+
+print(p_boot)
 
 
