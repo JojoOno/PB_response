@@ -1,0 +1,620 @@
+---
+title: "Polar Bear Behavioural Response to Industrial Activity — Re-Analysis"
+author: "Joe Onoufriou"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 150
+)
+```
+
+# Background
+
+This document walks through the re-analysis of the polar bear behavioural response dataset, the data as provided in its rawest form to JO. The original analysis gave us a good starting point, but it had a few gaps that needed addressing as indicated by the reviewer(s): predictors needed evaluated together in one go, we hadn't formally tested the interactions we'd expect biologically, and uncertainty wasn't being propogated through all steps of the analysis and data streams. This has now been attempted to be addressed in a unified logistic regression framework that looks at all the key predictors simultaneously, runs them through a small set of candidate models, and carries uncertainty through to the final outputs. The upshot is that model selection is transparent and reproducible, all predictions come with confidence intervals, and results are connected to distances that have policy implications and relevance. With any luck, this gives us a solid evidence base to revisit the current distance thresholds or at least discuss them.
+
+---
+
+# Packages
+
+Just loading what we need below. The random seed is fixed so that the bootstrap results come out the same every time the document is knitted — important for reproducibility.
+
+```{r packages}
+library(tidyverse)
+library(janitor)
+library(splines)
+library(MuMIn)
+library(performance)
+library(DHARMa)
+library(pROC)
+library(scales)
+
+set.seed(123)
+```
+
+---
+
+# Data Preparation
+
+The dataset is read in from the CSV and tidied up. Raw text fields get standardised on import — whitespace trimmed, case made consistent — and we pull out just the variables we actually need for modelling. Where a variable is spread across more than one field (activity class and cub presence being the main culprits), we combine them with a sensible priority order, using the secondary field to fill in gaps from the primary.
+
+A quick summary of the key variables:
+
+**Behavioural response.** Each encounter is either a reaction (`yes`) or no reaction (`no`). Anything coded as "not analyzed" or left blank gets treated as missing and dropped.
+
+**Distance.** Closest recorded distance between the bear and the activity, in metres. Missing or zero distances are excluded.
+
+**Activity class.** Whether the nearby activity was *stationary* or *mobile*, drawn first from the dedicated activity field and topped up from the nearest-activity field where needed. Worth flagging for the manuscript — as discussed with KLM, "stationary" here also covers pad operations, so we might want a clearer label to avoid confusion.
+
+**Season.** *Ice* or *open water* — straightforward.
+
+**Group composition.** Whether cubs were present (`female with cubs`) or not (`no cubs`), pieced together from the presence/absence flag and the cub count fields to handle any inconsistencies between them.
+
+**Survey method.** The observation platform — land, sea, air, or hovercraft — kept in as a potential covariate.
+
+
+```{r data-prep}
+data_path <- "PBResponse_Data.csv"
+
+pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  transmute(
+    record_id  = unique_record_id,
+    confirmed  = str_to_upper(str_trim(confirmed_pb)),
+    distance_m = readr::parse_number(closest_distance_meter),
+    response_raw = str_to_lower(str_trim(response)),
+    response_type_raw = str_to_lower(str_trim(behavior_change_response)),
+
+    activity2_raw = str_to_lower(str_trim(activity2)),
+    nearest_activity_raw = str_to_lower(str_trim(nearest_activity)),
+
+    season_iow_raw = str_to_upper(str_trim(season_i_ow)),
+    survey_method_raw = str_to_lower(str_trim(survey_method_air_land_sea)),
+
+    cub_yn_raw = str_to_upper(str_trim(cub_y_n)),
+    m_cub = suppressWarnings(as.integer(m_cub)),
+    f_cub = suppressWarnings(as.integer(f_cub)),
+    u_cub = suppressWarnings(as.integer(u_cub)),
+
+    year    = suppressWarnings(as.integer(year)),
+    unit    = unit,
+    site    = map_site,
+    grid_id = grid_id
+  ) %>%
+  mutate(
+    confirmed = factor(if_else(confirmed == "Y", "yes", "no"), levels = c("no","yes")),
+
+    response = case_when(
+      response_raw == "response"    ~ "yes",
+      response_raw == "no response" ~ "no",
+      TRUE                          ~ NA_character_
+    ) %>% factor(levels = c("no","yes")),
+    response_num = as.integer(response == "yes"),
+
+    response_type = case_when(
+      response == "yes" & str_detect(response_type_raw, "walk") ~ "walk",
+      response == "yes" & str_detect(response_type_raw, "swim") ~ "swim",
+      response == "yes" & str_detect(response_type_raw, "run")  ~ "run",
+      TRUE                                                      ~ NA_character_
+    ) %>% factor(levels = c("walk","swim","run")),
+
+    activity_class = case_when(
+      activity2_raw == "stationary" ~ "stationary",
+      activity2_raw == "mobile"     ~ "mobile",
+      nearest_activity_raw %in% c("pad operations", "pad operations ", "pad operations") ~ "stationary",
+      nearest_activity_raw %in% c("driving","vessel","aircraft") ~ "mobile",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("stationary","mobile")),
+
+    season = case_when(
+      season_iow_raw == "I"  ~ "ice",
+      season_iow_raw == "OW" ~ "open_water",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("ice","open_water")),
+
+    cubs_count   = coalesce(m_cub,0L) + coalesce(f_cub,0L) + coalesce(u_cub,0L),
+    cubs_present = (cub_yn_raw == "Y") | (cubs_count > 0),
+
+    group_comp = if_else(cubs_present, "female_with_cubs", "no_cubs") %>%
+      factor(levels = c("no_cubs","female_with_cubs")),
+
+    survey_method = case_when(
+      survey_method_raw == "land"       ~ "Land",
+      survey_method_raw == "sea"        ~ "Sea",
+      survey_method_raw == "air"        ~ "Air",
+      survey_method_raw == "hovercraft" ~ "Hovercraft",
+      TRUE ~ NA_character_
+    ) %>% factor()
+  )
+```
+
+---
+
+# Analysis Dataset
+
+We keep only confirmed polar bear observations with valid distances and complete covariate records. The table below gives a quick summary of what we're working with — sample size, overall reaction rate, and how distances are spread.
+So we've got 2,406 observations to work with, a reaction rate of around 24.6%, and distances ranging from 1 m right out to nearly 9 km — with a median of 200 m. 
+
+```{r analysis-dataset}
+dat <- pb %>%
+  filter(
+    confirmed == "yes",
+    !is.na(distance_m), distance_m > 0,
+    !is.na(response),
+    !is.na(activity_class),
+    !is.na(season),
+    !is.na(group_comp)
+  )
+
+dat %>%
+  summarise(
+    `N observations`       = n(),
+    `Reaction rate`        = scales::percent(mean(response == "yes"), accuracy = 0.1),
+    `Min distance (m)`     = min(distance_m),
+    `Median distance (m)`  = median(distance_m),
+    `Max distance (m)`     = max(distance_m)
+  )
+```
+
+---
+
+# Candidate Model Set and AICc Selection
+
+## Modelling approach
+
+The probability of a behavioural reaction is modelled as a binary outcome (reaction / no reaction) using logistic regression. Rather than fitting a single pre-specified model, a small transparent candidate set is constructed. This approach is consistent with reviewer requests for a unified model that evaluates all key predictors simultaneously while remaining explicit about uncertainty in model structure.
+
+The candidate set varies along two dimensions. First, the distance–response relationship is represented in three ways: as a linear term scaled to units of 100 m, as a natural logarithm, and as a natural cubic spline with four degrees of freedom. The linear and log forms impose interpretable monotone shapes, while the spline allows the relationship to deviate from these assumptions if the data support it. Essentially, a spline can provide 'wiggliness' (an often accepted term!) to allow non-linear variations in response with increasing distance. Second, within each distance form, up to four models of increasing covariate complexity are considered: distance alone (base); distance interacting with activity class; that model plus season and group composition with their interaction; and a further model adding survey method where more than one method is present in the data.
+
+## AICc function and model fitting
+
+```{r aicc-function}
+AICc <- function(model) {
+  aic <- AIC(model)
+  k   <- attr(logLik(model), "df")
+  n   <- stats::nobs(model)
+  if (is.na(n) || (n - k - 1) <= 0) return(aic)
+  aic + (2 * k * (k + 1)) / (n - k - 1)
+}
+```
+
+```{r candidate-models}
+fit_candidate_set <- function(dat, dist_term) {
+  f_base   <- as.formula(paste0("response ~ ", dist_term))
+  f_act    <- as.formula(paste0("response ~ ", dist_term, " * activity_class"))
+  f_core   <- as.formula(paste0("response ~ ", dist_term, " * activity_class + season * group_comp"))
+  f_survey <- as.formula(paste0("response ~ ", dist_term, " * activity_class + season * group_comp + survey_method"))
+
+  mods <- list(
+    base = glm(f_base, data = dat, family = binomial()),
+    act  = glm(f_act,  data = dat, family = binomial()),
+    core = glm(f_core, data = dat, family = binomial())
+  )
+
+  if ("survey_method" %in% names(dat) && nlevels(droplevels(dat$survey_method)) > 1) {
+    mods$survey <- glm(f_survey, data = dat, family = binomial())
+  }
+
+  mods
+}
+
+mods_lin <- fit_candidate_set(dat, "I(distance_m/100)")
+mods_log <- fit_candidate_set(dat, "log(distance_m)")
+mods_spl <- fit_candidate_set(dat, "splines::ns(distance_m, df=4)")
+
+mods_all <- c(
+  purrr::imap(mods_lin, ~ setNames(list(.x), paste0("lin_", .y))),
+  purrr::imap(mods_log, ~ setNames(list(.x), paste0("log_", .y))),
+  purrr::imap(mods_spl, ~ setNames(list(.x), paste0("spl_", .y)))
+) %>% unlist(recursive = FALSE)
+```
+
+## Model selection table
+
+Models are ranked by AICc. The delta column gives the difference in AICc relative to the best-supported model, and weights express each model's relative support as a share of the total evidence across the candidate set. Models within two AICc units of the top model are considered to have comparable empirical support and are reported separately below.
+
+The model selection table provides strong support for a single top model: a spline-based distance term interacting with activity class, combined with season, group composition, and survey method as additional covariates (spl_survey). No other model comes within 8 AICc units of the top model, and the ΔAICc < 2 threshold is met by this model alone (this is the general rule for model selection using AIC - if a simpler model reduces the AIC by 2 or more, thewn it is favourable or "more parismonius" in the Okkams Razxor sense. The clear winner here is both the flexible spline distance form and the inclusion of survey method as a covariate — the equivalent log-distance model with survey method (log_survey) is the next best but sits nearly 9 units behind. This gives confidence that the selected model structure is appropriate and that model-averaging or multi-model inference is not required here.
+
+```{r selection-table}
+sel_tbl <- purrr::imap_dfr(mods_all, function(m, nm) {
+  tibble(
+    model = nm,
+    k     = attr(logLik(m), "df"),
+    n     = nobs(m),
+    AIC   = round(AIC(m), 2),
+    AICc  = round(AICc(m), 2)
+  )
+}) %>%
+  arrange(AICc) %>%
+  mutate(
+    delta  = round(AICc - min(AICc), 2),
+    weight = round(exp(-0.5 * delta) / sum(exp(-0.5 * delta)), 3)
+  )
+
+sel_tbl
+```
+
+## Top model summary
+
+The highest-ranked model is used for all subsequent inference and prediction. Its coefficient estimates, standard errors, and significance values are shown below. The model summary reveals a strong and highly significant effect of distance on reaction probability, captured across the spline terms. Three of the four spline basis coefficients are statistically significant (p < 0.01), confirming that the distance–response relationship is real and robust, and the overall reduction in deviance from the null model (2,600.6) to the fitted model (2,237.6) — a reduction of approximately 363 units on 15 degrees of freedom — reflects a substantial improvement in fit. In contrast, the individual main effects of activity class, season, group composition, and survey method are not statistically significant on their own, though the interaction between distance and activity class is significant at the first spline knot (p = 0.002), indicating that the shape of the distance–response relationship does differ meaningfully between stationary and mobile activities at closer ranges (we can chat about knots and their meaning some more during the meeting). The large standard error and near-zero coefficient for hovercraft survey method reflects very few observations from that platform and should be interpreted with caution; it does not affect predictions made under the other survey method levels.
+
+I understand it can be confusing that there are non-significant model covariates that are retained through the model selection process but we can discuss this during the meeting.
+
+```{r top-model}
+final_model <- mods_all[[sel_tbl$model[1]]]
+summary(final_model)
+```
+
+## Models within ΔAICc < 2
+
+```{r top-set}
+top_names   <- sel_tbl %>% filter(delta < 2) %>% pull(model)
+top_models  <- mods_all[top_names]
+top_weights <- sel_tbl %>% filter(delta < 2) %>% pull(weight)
+
+sel_tbl %>% filter(delta < 2)
+```
+
+---
+
+# Model Diagnostics
+
+Before drawing inference from the selected model, a series of diagnostic checks are applied to verify that modelling assumptions are adequately met.
+
+## Collinearity
+
+Variance inflation factors are examined to confirm that predictors are not so strongly correlated as to destabilise coefficient estimates. Values substantially above 5–10 would give cause for concern.
+
+```{r collinearity}
+performance::check_collinearity(final_model)
+```
+
+## Simulated residual diagnostics 
+
+Simulation-based residuals are generated by comparing observed outcomes against the distribution expected under the fitted model across 500 simulations. The left panel of the plot below shows a QQ plot of scaled residuals against the uniform distribution expected under a correctly specified model; the right panel plots residuals against predicted values and can reveal patterns such as non-linearity or heteroscedasticity. Formal tests for overdispersion, zero-inflation, and outliers are reported alongside the plots.
+
+These plots provide a pretty reassuring picture of model fit. The dispersion test returns a ratio of 0.998 and a p-value of 0.92, indicating no evidence of overdispersion or underdispersion — the variance in the data is entirely consistent with binomial assumptions. The zero-inflation test similarly shows no concern, with an observed-to-simulated ratio of 1.000 and a p-value of 0.984, confirming that the number of non-reaction observations in the data is no greater than the model would predict by chance. The outlier test identifies 6 outlying observations from 2,365 (a frequency of 0.25%), which is actually slightly below the expected rate under a well-specified model (0.40%), and the corresponding p-value of 0.327 provides no grounds to flag these as problematic. Taken together, these diagnostics indicate that the selected model is well-specified and that its assumptions are adequately met so no need to go further with any fancy auto-correlation functions!
+
+```{r dharma-plot, fig.cap="Simulated residual diagnostics. Left: QQ plot of scaled residuals. Right: residuals versus predicted values."}
+sim <- DHARMa::simulateResiduals(final_model, n = 500)
+plot(sim)
+```
+
+```{r dharma-tests}
+DHARMa::testDispersion(sim)
+DHARMa::testZeroInflation(sim)
+DHARMa::testOutliers(sim)
+```
+
+## Discriminatory ability (AUC)
+
+The area under the receiver operating characteristic curve (AUC) summarises how well the model's predicted probabilities discriminate between observations that did and did not result in a behavioural reaction. A value of 0.5 indicates no discriminatory ability; values approaching 1.0 indicate near-perfect discrimination.
+
+The model achieves an AUC of 0.755, indicating moderate to good discriminatory ability (though this is a somewhat arbitrary terms here, under the conventional rules it's roughly "pretty good" I'd say). It correctly ranks a reacting bear above a non-reacting bear in approximately 75.5% of all possible pairings. For a behavioural ecology application of this kind, where individual variation in response is genuinely high and some degree of unpredictability is biologically real, this represents a meaningful level of predictive performance. It is worth noting that AUC is calculated on the training data, so the true out-of-sample performance would likely be somewhat lower; however, given that the goal here is inference about population-level response patterns rather than individual-level classification, I think this is an acceptable limitation but that will have to be discussed in the manuscript. Bottom line: The ROC curve shows the model achieves reasonable sensitivity without incurring an excessive false positive rate across most threshold values.
+
+```{r auc}
+dat <- dat %>%
+  mutate(pred_prob = predict(final_model, newdata = dat, type = "response"))
+
+auc_val <- pROC::roc(
+  response  = dat$response_num,
+  predictor = dat$pred_prob,
+  quiet     = TRUE
+) %>% pROC::auc()
+
+cat("AUC:", round(as.numeric(auc_val), 3))
+```
+
+```{r auc-plot, fig.cap="Receiver operating characteristic (ROC) curve for the top-ranked model. The curve traces the trade-off between true positive rate (sensitivity) and false positive rate (1 − specificity) as the classification threshold varies from 0 to 1. The shaded area represents the AUC. The dashed diagonal line represents chance-level discrimination (AUC = 0.5). Points further toward the top-left corner indicate better model performance."}
+
+roc_obj <- pROC::roc(
+  response  = dat$response_num,
+  predictor = dat$pred_prob,
+  quiet     = TRUE
+)
+
+# Extract coordinates into a data frame for ggplot
+roc_df <- data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+
+auc_label <- paste0("AUC = ", round(as.numeric(pROC::auc(roc_obj)), 3))
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_ribbon(aes(ymin = 0, ymax = tpr), fill = "#2c7bb6", alpha = 0.15) +
+  geom_line(colour = "#2c7bb6", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50", linewidth = 0.7) +
+  annotate("text", x = 0.75, y = 0.15, label = auc_label,
+           size = 4.5, colour = "#2c7bb6", fontface = "bold") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = c(0.01, 0.01)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = c(0.01, 0.01)) +
+  labs(
+    x     = "False positive rate (1 − Specificity)",
+    y     = "True positive rate (Sensitivity)",
+    title = "ROC Curve — binary reaction model"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+---
+
+# Distance–Response Curve
+
+Predicted reaction probability is plotted as a continuous function of distance, with separate curves for stationary and mobile activity classes. All other covariates are held at reference levels: open water season and no cubs present. Shaded ribbons show 95% confidence intervals, derived from the standard error of the linear predictor and back-transformed to the probability scale. The prediction range covers the central 98% of observed distances to avoid extrapolation at the extremes.
+
+```{r pred-grid}
+make_pred_grid <- function(dat, season_ref = "open_water",
+                           group_ref = "no_cubs", survey_ref = NULL) {
+  dist_seq <- seq(
+    quantile(dat$distance_m, 0.01),
+    quantile(dat$distance_m, 0.99),
+    length.out = 250
+  )
+
+  g <- tidyr::expand_grid(
+    distance_m     = dist_seq,
+    activity_class = levels(dat$activity_class),
+    season         = factor(season_ref, levels = levels(dat$season)),
+    group_comp     = factor(group_ref,  levels = levels(dat$group_comp))
+  )
+
+  if ("survey_method" %in% all.vars(formula(final_model))) {
+    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
+    g <- g %>%
+      mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
+  }
+
+  g
+}
+```
+
+```{r pred-curve, fig.cap="Predicted probability of a behavioural reaction as a function of distance to the nearest industrial activity. Curves are shown separately for stationary and mobile activities; ribbons show 95% confidence intervals. Season is held at open water and group composition at no cubs present.", echo=FALSE}
+pred_grid <- make_pred_grid(dat)
+pred_link <- predict(final_model, newdata = pred_grid, type = "link", se.fit = TRUE)
+
+pred_df <- pred_grid %>%
+  mutate(
+    link = pred_link$fit,
+    se   = pred_link$se.fit,
+    prob = plogis(link),
+    lo   = plogis(link - 1.96 * se),
+    hi   = plogis(link + 1.96 * se)
+  )
+
+p_curve <- ggplot(pred_df, aes(distance_m, prob,
+                               colour = activity_class,
+                               fill   = activity_class)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x        = "Distance (m)",
+    y        = "Predicted probability of behavioural reaction",
+    title    = "Distance–response curve (binary reaction model)",
+    subtitle = "95% CI ribbons; season = open water, group composition = no cubs",
+    colour   = "Activity class",
+    fill     = "Activity class"
+  ) +
+  theme_minimal()
+
+print(p_curve)
+```
+
+---
+
+# Predicted Probabilities at Management Distances
+
+Predicted reaction probabilities are extracted at two distances of direct operational relevance: 805 m and 1,610 m. These are reported alongside 95% confidence intervals under the same reference covariate settings used for the prediction curves above (open water season, no cubs present, stationary activity class as baseline).
+
+At 805 m, the model predicts a reaction probability of 4.3% under reference conditions (open water, no cubs, stationary activity), which falls just below the 5% threshold that is often used as a practical lower bound for risk. At 1,610 m, the predicted probability falls slightly further to 3.5%. While the point estimates suggest that reaction risk is low at both distances, the confidence intervals are notably wide, spanning from below 1% to approximately 25–29% at both distances. This reflects genuine uncertainty in the predicted probabilities at these specific distances, stemming from the flexible spline model form and the relatively sparse data at larger distances. These wide intervals should be communicated clearly when these figures are used to inform management decisions, and point estimates alone should not be cited without their associated uncertainty.
+
+```{r mgmt-table, echo=FALSE}
+pred_at_distance <- function(d) {
+  nd <- make_pred_grid(dat) %>%
+    slice(1) %>%
+    mutate(distance_m = d)
+
+  pr <- predict(final_model, newdata = nd, type = "link", se.fit = TRUE)
+
+  tibble(
+    `Distance (m)` = d,
+    `Predicted probability` = scales::percent(plogis(pr$fit), accuracy = 0.1),
+    `Lower 95% CI`          = scales::percent(plogis(pr$fit - 1.96 * pr$se.fit), accuracy = 0.1),
+    `Upper 95% CI`          = scales::percent(plogis(pr$fit + 1.96 * pr$se.fit), accuracy = 0.1)
+  )
+}
+
+mgmt_tbl <- map_dfr(c(805, 1610), pred_at_distance)
+mgmt_tbl
+```
+
+---
+
+# Distance Thresholds at Target Reaction Probabilities
+
+In addition to predicted probabilities at fixed distances, the analysis estimates the distance at which the predicted reaction probability drops to each of two target thresholds: 5% and 10%. These thresholds represent residual risk levels that may be relevant for setting operational exclusion zones or activity buffers.
+
+Point estimates are obtained by searching along the predicted distance–response curve for the crossing point using a fine distance grid. Uncertainty is quantified via a parametric bootstrap: 1,000 sets of model coefficients are drawn from the multivariate normal distribution defined by the fitted coefficients and their estimated covariance matrix. The threshold distance is recalculated for each draw, and the 2.5th and 97.5th percentiles of the resulting distribution form the 95% confidence interval. Thresholds are reported separately for stationary and mobile activity classes, with all other covariates held at reference levels.
+
+The estimated threshold distances at which the predicted reaction probability drops to 5% or 10% carry very wide confidence intervals, and for mobile activity at the 5% threshold no finite point estimate could be obtained within the observed distance range. For stationary activity, the 5% threshold is estimated at approximately 398 m (95% CI: 32–9,403 m), and for mobile activity the 10% threshold is estimated at 1,349 m (95% CI: 1–5,583 m). The extreme width of these intervals reflects two things: the inherent uncertainty in the spline model at the tails of the distance distribution, and the fact that the predicted distance–response curve for mobile activity does not decline as steeply or as smoothly as for stationary activity, making the crossing of a specific probability threshold less precisely defined. These results suggest that while distance is clearly an important predictor of reaction probability, the data do not support precise threshold recommendations at this stage. I would suggest that any management distances derived from these estimates should be treated as indicative rather than definitive, and the confidence intervals should feature VERY prominently in any  communication.
+
+> **Note:** This section may take approximately 30–60 seconds to run due to the bootstrap iterations.
+
+```{r threshold-helpers, echo=FALSE}
+make_newdata_template <- function(dat, activity_class_value,
+                                  season_ref = "open_water",
+                                  group_ref  = "no_cubs",
+                                  survey_ref = NULL) {
+  nd <- tibble(
+    distance_m     = median(dat$distance_m, na.rm = TRUE),
+    activity_class = factor(activity_class_value, levels = levels(dat$activity_class)),
+    season         = factor(season_ref, levels = levels(dat$season)),
+    group_comp     = factor(group_ref,  levels = levels(dat$group_comp))
+  )
+
+  if ("survey_method" %in% names(dat)) {
+    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
+    nd <- nd %>%
+      mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
+  }
+
+  nd
+}
+
+threshold_distance_from_beta <- function(model, nd_template, target_prob,
+                                          dist_grid, beta_vec) {
+  nd <- nd_template[rep(1, length(dist_grid)), , drop = FALSE]
+  nd$distance_m <- dist_grid
+
+  X   <- model.matrix(stats::delete.response(stats::terms(model)), nd)
+  eta <- drop(X %*% beta_vec)
+  p   <- plogis(eta)
+
+  if (p[1] <= target_prob) return(dist_grid[1])
+
+  idx <- which(p <= target_prob)[1]
+  if (is.na(idx) || idx == 1) return(NA_real_)
+
+  d1 <- dist_grid[idx - 1]
+  d2 <- dist_grid[idx]
+
+  f <- function(d) {
+    nd1           <- nd_template
+    nd1$distance_m <- d
+    X1 <- model.matrix(stats::delete.response(stats::terms(model)), nd1)
+    plogis(drop(X1 %*% beta_vec)) - target_prob
+  }
+
+  tryCatch(
+    stats::uniroot(f, lower = d1, upper = d2)$root,
+    error = function(e) NA_real_
+  )
+}
+```
+
+```{r thresholds, cache=TRUE, echo=FALSE}
+estimate_distance_thresholds <- function(model, dat,
+                                          targets        = c(0.05, 0.10),
+                                          season_ref     = "open_water",
+                                          group_ref      = "no_cubs",
+                                          survey_ref     = NULL,
+                                          B              = 1000,
+                                          grid_n         = 2000,
+                                          grid_max_mult  = 5) {
+  min_d     <- max(min(dat$distance_m, na.rm = TRUE), 1e-3)
+  max_d     <- max(dat$distance_m, na.rm = TRUE) * grid_max_mult
+  dist_grid <- seq(min_d, max_d, length.out = grid_n)
+
+  beta_hat <- coef(model)
+  V        <- vcov(model)
+  cholV    <- tryCatch(chol(V), error = function(e) NULL)
+
+  draw_beta <- function() {
+    if (is.null(cholV)) return(beta_hat)
+    beta_hat + drop(t(cholV) %*% rnorm(length(beta_hat)))
+  }
+
+  tidyr::expand_grid(
+    activity_class = levels(dat$activity_class),
+    target_prob    = targets
+  ) %>%
+    mutate(
+      estimate_m = map2_dbl(activity_class, target_prob, ~ {
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        threshold_distance_from_beta(model, nd0, .y, dist_grid, beta_hat)
+      }),
+      boot = map2(activity_class, target_prob, ~ {
+        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
+        replicate(B, {
+          threshold_distance_from_beta(model, nd0, .y, dist_grid, draw_beta())
+        })
+      }),
+      ci_lo_m = map_dbl(boot, ~ quantile(.x, 0.025, na.rm = TRUE)),
+      ci_hi_m = map_dbl(boot, ~ quantile(.x, 0.975, na.rm = TRUE))
+    ) %>%
+    select(-boot) %>%
+    mutate(
+      estimate_km = estimate_m / 1000,
+      ci_lo_km    = ci_lo_m   / 1000,
+      ci_hi_km    = ci_hi_m   / 1000
+    )
+}
+
+dist_thresh_tbl <- estimate_distance_thresholds(
+  model      = final_model,
+  dat        = dat,
+  targets    = c(0.05, 0.10),
+  season_ref = "open_water",
+  group_ref  = "no_cubs",
+  survey_ref = if ("survey_method" %in% names(dat)) levels(dat$survey_method)[1] else NULL,
+  B          = 1000
+)
+
+dist_thresh_pretty <- dist_thresh_tbl %>%
+  mutate(
+    `Activity class`    = activity_class,
+    `Target probability` = scales::percent(target_prob, accuracy = 1),
+    `Estimate (m)`      = round(estimate_m),
+    `Lower 95% CI (m)`  = round(ci_lo_m),
+    `Upper 95% CI (m)`  = round(ci_hi_m),
+    `Estimate (km)`     = round(estimate_km, 2),
+    `Lower 95% CI (km)` = round(ci_lo_km, 2),
+    `Upper 95% CI (km)` = round(ci_hi_km, 2)
+  ) %>%
+  select(`Activity class`, `Target probability`,
+         `Estimate (m)`, `Lower 95% CI (m)`, `Upper 95% CI (m)`,
+         `Estimate (km)`, `Lower 95% CI (km)`, `Upper 95% CI (km)`)
+
+dist_thresh_pretty
+```
+
+---
+
+# Save Outputs
+
+All key results are written to a `results` subfolder in the working directory. This includes the model selection table, predicted probabilities at the two management distances, the distance threshold estimates, and the predicted distance–response curve as a high-resolution PNG. A record of the R session environment is also saved to support reproducibility.
+
+```{r save-outputs, include=FALSE}
+dir.create("results", showWarnings = FALSE)
+
+write_csv(mgmt_tbl,            "results/management_probs_805_1610.csv")
+write_csv(sel_tbl,             "results/model_selection_candidate_set.csv")
+write_csv(dist_thresh_tbl,     "results/distance_thresholds_raw.csv")
+write_csv(dist_thresh_pretty,  "results/distance_thresholds_pretty.csv")
+
+ggsave("results/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
+
+writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
+```
+
+Outputs saved to `./results/`:
+
+- `management_probs_805_1610.csv` — predicted reaction probabilities at 805 m and 1,610 m
+- `model_selection_candidate_set.csv` — full AICc model selection table
+- `distance_thresholds_raw.csv` — raw threshold distance estimates with bootstrap confidence intervals
+- `distance_thresholds_pretty.csv` — formatted version of threshold table for reporting
+- `pred_curve.png` — distance–response curve (300 dpi)
+- `sessionInfo.txt` — R session information for reproducibility
+
+---
