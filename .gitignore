@@ -5,3 +5,8 @@
 /PBResponse_Data.csv
 /key_column_value_counts.csv
 /results
+/Optional-Hurdle.R
+*.html
+*.pdf
+*_cache/
+*_files/

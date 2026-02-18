@@ -3,13 +3,10 @@
 # Unified modelling workflow (binary primary model + optional type model)
 # Data file: PBResponse_Data.csv OR PBResponse_Data.xlsx (in working dir)
 ############################################################
-# PB behavioural response: streamlined, candidate-set workflow
-# (matches reviewer asks: unified model, simultaneous predictors, AICc candidate set,
-# optional hurdle/type model add-on)
+
 
 # ---- Packages ----
-# Suggestion: don't install packages inside the analysis script.
-# If needed, install once manually or use renv.
+
 library(tidyverse)
 library(janitor)
 library(splines)
@@ -22,7 +19,7 @@ library(scales)
 set.seed(123)
 
 # ---- 1) Read + compact modelling table ----
-data_path <- "PBResponse_Data.csv"  # adjust if needed
+data_path <- "PBResponse_Data.csv"  
 
 pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
   janitor::clean_names() %>%
@@ -81,14 +78,14 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
       TRUE ~ NA_character_
     ) %>% factor(levels = c("stationary","mobile")),
     
-    # season: just I vs OW in this dataset
+    # season: just I vs OW 
     season = case_when(
       season_iow_raw == "I"  ~ "ice",
       season_iow_raw == "OW" ~ "open_water",
       TRUE ~ NA_character_
     ) %>% factor(levels = c("ice","open_water")),
     
-    # cubs: use cub flag OR cub counts (handles inconsistencies)
+    # cubs: use cub flag OR cub counts 
     cubs_count = coalesce(m_cub,0L) + coalesce(f_cub,0L) + coalesce(u_cub,0L),
     cubs_present = (cub_yn_raw == "Y") | (cubs_count > 0),
     
@@ -125,7 +122,7 @@ dat %>%
     dist_max = max(distance_m)
   ) %>% print()
 
-# ---- 3) Candidate model set + AICc selection (NO MuMIn) --------------------
+# ---- 3) Candidate model set + AICc selection ---
 
 # AICc calculator (works for glm; uses logLik df for k)
 AICc <- function(model) {
@@ -137,7 +134,7 @@ AICc <- function(model) {
   aic + (2 * k * (k + 1)) / (n - k - 1)
 }
 
-# Build a small, transparent candidate set (reviewer-friendly)
+# Build a small, transparent candidate set 
 fit_candidate_set <- function(dat, dist_term) {
   f_base   <- as.formula(paste0("response ~ ", dist_term))
   f_act    <- as.formula(paste0("response ~ ", dist_term, " * activity_class"))
@@ -192,7 +189,7 @@ print(sel_tbl)
 final_model <- mods_all[[sel_tbl$model[1]]]
 summary(final_model)
 
-# If you want the "ΔAICc < 2" set:
+# Using the rule forn "ΔAICc < 2" set:
 top_names <- sel_tbl %>% filter(delta < 2) %>% pull(model)
 top_models <- mods_all[top_names]
 top_weights <- sel_tbl %>% filter(delta < 2) %>% pull(weight)
@@ -200,10 +197,15 @@ top_weights <- sel_tbl %>% filter(delta < 2) %>% pull(weight)
 cat("\nTop set (ΔAICc < 2):\n")
 print(sel_tbl %>% filter(delta < 2))
 
-# ---- 4) Diagnostics ----
+# ---- 4) Model Diagnostics ----
 print(performance::check_collinearity(final_model))
 print(performance::check_overdispersion(final_model))
-print(performance::check_influential(final_model))
+# Influence diagnostics 
+infl <- influence.measures(final_model)
+summary(infl)
+
+# Indices of points flagged as influential by any measure - might need to hcta to Kate about this one to see whether these points warrant a further look. For now looks fine.
+which(apply(infl$is.inf, 1, any))
 
 sim <- DHARMa::simulateResiduals(final_model, n = 500)
 plot(sim)
@@ -212,9 +214,46 @@ DHARMa::testZeroInflation(sim)
 DHARMa::testOutliers(sim)
 
 # AUC
-dat <- dat %>% mutate(pred_prob = predict(final_model, type = "response"))
+dat <- dat %>%
+  mutate(pred_prob = predict(final_model, newdata = dat, type = "response"))
 auc <- pROC::roc(response = dat$response_num, predictor = dat$pred_prob, quiet = TRUE) %>% pROC::auc()
 cat("\nAUC:", as.numeric(auc), "\n")
+
+roc_obj <- pROC::roc(
+  response  = dat$response_num,
+  predictor = dat$pred_prob,
+  quiet     = TRUE
+)
+
+# Build ROC curve
+roc_df <- data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+
+auc_label <- paste0("AUC = ", round(as.numeric(pROC::auc(roc_obj)), 3))
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_ribbon(aes(ymin = 0, ymax = tpr), fill = "#2c7bb6", alpha = 0.15) +
+  geom_line(colour = "#2c7bb6", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50", linewidth = 0.7) +
+  annotate("text", x = 0.75, y = 0.15, label = auc_label,
+           size = 4.5, colour = "#2c7bb6", fontface = "bold") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = c(0.01, 0.01)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = c(0.01, 0.01)) +
+  labs(
+    x     = "False positive rate (1 − Specificity)",
+    y     = "True positive rate (Sensitivity)",
+    title = "ROC Curve — binary reaction model"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
 
 # ---- 5) Prediction curve (distance-response) ----
 make_pred_grid <- function(dat, season_ref = "open_water", group_ref = "no_cubs", survey_ref = NULL) {
@@ -262,13 +301,13 @@ p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill =
 
 print(p_curve)
 
-# ---- 6) Management outputs table (805 m and 1610 m) ----
-# These are explicitly mentioned in your proposal as likely reporting distances.
+# ---- 6) Poliucy relevant outputs table (805 m and 1610 m) ----
+
 key_dists <- c(805, 1610)
 
 pred_at_distance <- function(d) {
   nd <- make_pred_grid(dat) %>%
-    slice(1) %>%                         # take a template row
+    slice(1) %>%                         
     mutate(distance_m = d)
   
   pr <- predict(final_model, newdata = nd, type = "link", se.fit = TRUE)
@@ -294,172 +333,5 @@ writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
 
 cat("\nDone. Results saved in ./results\n")
 
-# ---- OPTIONAL: Hurdle-style “response type” add-on (Reviewer 1 request) ----
-# (1) binary model above: react vs not
-# (2) conditional multinomial among reactors only (walk/swim/run)
-# This is the lightest-weight way to address the “type” critique without overbuilding.
-#
-# library(nnet)
-# dat_type <- dat %>% filter(response == "yes", !is.na(response_type))
-# type_mod <- nnet::multinom(response_type ~ log(distance_m) + activity_class + season + group_comp,
-#                            data = dat_type, trace = FALSE)
-# summary(type_mod)
 
-
-# ---- 6) Distance thresholds for target reaction probabilities (with uncertainty) ----
-# Finds the distance where predicted P(reaction) drops to a target (e.g., 0.05, 0.10)
-# Uses parametric bootstrap on coefficients (MVN approx) to get 95% CI.
-
-# Helper: build a 1-row newdata template with your chosen reference settings
-make_newdata_template <- function(dat, activity_class_value,
-                                  season_ref = "open_water",
-                                  group_ref  = "no_cubs",
-                                  survey_ref = NULL) {
-  
-  nd <- tibble(
-    distance_m = median(dat$distance_m, na.rm = TRUE),
-    activity_class = factor(activity_class_value, levels = levels(dat$activity_class)),
-    season = factor(season_ref, levels = levels(dat$season)),
-    group_comp = factor(group_ref, levels = levels(dat$group_comp))
-  )
-  
-  # Include survey_method only if it exists in dat (and possibly in model)
-  if ("survey_method" %in% names(dat)) {
-    if (is.null(survey_ref)) survey_ref <- levels(dat$survey_method)[1]
-    nd <- nd %>% mutate(survey_method = factor(survey_ref, levels = levels(dat$survey_method)))
-  }
-  
-  nd
-}
-
-# Core function: threshold distance given a coefficient vector beta
-threshold_distance_from_beta <- function(model, nd_template, target_prob,
-                                         dist_grid, beta_vec) {
-  
-  # Build model matrix for each distance on the grid
-  nd <- nd_template[rep(1, length(dist_grid)), , drop = FALSE]
-  nd$distance_m <- dist_grid
-  
-  X <- model.matrix(stats::delete.response(stats::terms(model)), nd)
-  eta <- drop(X %*% beta_vec)
-  p   <- plogis(eta)
-  
-  # We want the FIRST distance where p <= target_prob
-  # If already below at the minimum grid distance, return that minimum
-  if (p[1] <= target_prob) return(dist_grid[1])
-  
-  idx <- which(p <= target_prob)[1]
-  if (is.na(idx) || idx == 1) return(NA_real_)  # never crosses within grid
-  
-  # Bracket around the crossing and refine using uniroot on the link scale
-  d1 <- dist_grid[idx - 1]
-  d2 <- dist_grid[idx]
-  
-  f <- function(d) {
-    nd1 <- nd_template
-    nd1$distance_m <- d
-    X1 <- model.matrix(stats::delete.response(stats::terms(model)), nd1)
-    plogis(drop(X1 %*% beta_vec)) - target_prob
-  }
-  
-  # Should bracket a root; uniroot refines it
-  out <- tryCatch(
-    stats::uniroot(f, lower = d1, upper = d2)$root,
-    error = function(e) NA_real_
-  )
-  out
-}
-
-# Wrapper: point estimate + bootstrap CI for each activity_class and target
-estimate_distance_thresholds <- function(model, dat,
-                                         targets = c(0.05, 0.10),
-                                         season_ref = "open_water",
-                                         group_ref  = "no_cubs",
-                                         survey_ref = NULL,
-                                         B = 1000,
-                                         grid_n = 2000,
-                                         grid_max_mult = 5) {
-  
-  # Distance grid for searching the crossing (extend beyond observed max a bit)
-  min_d <- max(min(dat$distance_m, na.rm = TRUE), 1e-3)
-  max_d <- max(dat$distance_m, na.rm = TRUE) * grid_max_mult
-  dist_grid <- seq(min_d, max_d, length.out = grid_n)
-  
-  beta_hat <- coef(model)
-  V <- vcov(model)
-  
-  # Precompute Cholesky for MVN draws; handle near-singular vcov gracefully
-  cholV <- tryCatch(chol(V), error = function(e) NULL)
-  
-  draw_beta <- function() {
-    if (is.null(cholV)) return(beta_hat) # fallback: no uncertainty if vcov fails
-    z <- rnorm(length(beta_hat))
-    beta_hat + drop(t(cholV) %*% z)
-  }
-  
-  res <- tidyr::expand_grid(
-    activity_class = levels(dat$activity_class),
-    target_prob = targets
-  ) %>%
-    mutate(
-      # point estimate using beta_hat
-      estimate_m = map2_dbl(activity_class, target_prob, ~{
-        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
-        threshold_distance_from_beta(model, nd0, .y, dist_grid, beta_hat)
-      }),
-      
-      # bootstrap draws
-      boot = map2(activity_class, target_prob, ~{
-        nd0 <- make_newdata_template(dat, .x, season_ref, group_ref, survey_ref)
-        replicate(B, {
-          b <- draw_beta()
-          threshold_distance_from_beta(model, nd0, .y, dist_grid, b)
-        })
-      }),
-      
-      ci_lo_m = map_dbl(boot, ~ quantile(.x, 0.025, na.rm = TRUE)),
-      ci_hi_m = map_dbl(boot, ~ quantile(.x, 0.975, na.rm = TRUE))
-    ) %>%
-    select(-boot) %>%
-    mutate(
-      estimate_km = estimate_m / 1000,
-      ci_lo_km    = ci_lo_m / 1000,
-      ci_hi_km    = ci_hi_m / 1000
-    )
-  
-  res
-}
-
-# Run it (choose reference settings to match your reporting scenario)
-# You can change season_ref/group_ref/survey_ref to whatever you want held constant.
-dist_thresh_tbl <- estimate_distance_thresholds(
-  model = final_model,
-  dat   = dat,
-  targets = c(0.05, 0.10),
-  season_ref = "open_water",
-  group_ref  = "no_cubs",
-  survey_ref = if ("survey_method" %in% names(dat)) levels(dat$survey_method)[1] else NULL,
-  B = 1000
-)
-
-print(dist_thresh_tbl)
-
-# Pretty version for reporting
-dist_thresh_pretty <- dist_thresh_tbl %>%
-  mutate(
-    target = scales::percent(target_prob, accuracy = 1),
-    estimate_m = round(estimate_m),
-    ci_lo_m    = round(ci_lo_m),
-    ci_hi_m    = round(ci_hi_m),
-    estimate_km = round(estimate_km, 2),
-    ci_lo_km    = round(ci_lo_km, 2),
-    ci_hi_km    = round(ci_hi_km, 2)
-  ) %>%
-  select(activity_class, target, estimate_m, ci_lo_m, ci_hi_m, estimate_km, ci_lo_km, ci_hi_km)
-
-print(dist_thresh_pretty)
-
-
-write_csv(dist_thresh_tbl,    "results/distance_thresholds_raw.csv")
-write_csv(dist_thresh_pretty, "results/distance_thresholds_pretty.csv")
 
