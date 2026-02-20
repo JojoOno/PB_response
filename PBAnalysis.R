@@ -29,6 +29,8 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
     distance_m = readr::parse_number(closest_distance_meter),
     response_raw = str_to_lower(str_trim(response)),
     response_type_raw = str_to_lower(str_trim(behavior_change_response)),
+    resighting = resighting_y_n_p,
+    hazing = hazing_y_or_n,
     
     # activity
     activity2_raw = str_to_lower(str_trim(activity2)),
@@ -106,6 +108,7 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
 dat <- pb %>%
   filter(
     confirmed == "yes",
+    resighting == "N", hazing == "N",  #added to filter out resightings and hazing events as per Kate's suggestion
     !is.na(distance_m), distance_m > 0,
     !is.na(response),
     !is.na(activity_class),
@@ -199,7 +202,7 @@ print(sel_tbl %>% filter(delta < 2))
 
 # ---- 4) Model Diagnostics ----
 print(performance::check_collinearity(final_model))
-print(performance::check_overdispersion(final_model))
+#print(performance::check_overdispersion(final_model))
 # Influence diagnostics 
 infl <- influence.measures(final_model)
 summary(infl)
