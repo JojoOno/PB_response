@@ -15,6 +15,7 @@ library(performance)
 library(DHARMa)
 library(pROC)
 library(scales)
+library(wesanderson)
 
 set.seed(123)
 
@@ -202,6 +203,13 @@ print(sel_tbl %>% filter(delta < 2))
 
 # ---- 4) Model Diagnostics ----
 print(performance::check_collinearity(final_model))
+# Fit main effects only version to check underlying collinearity as interaction terms are high
+mod_no_interaction <- glm(
+  response ~ splines::ns(distance_m, df = 4) + activity_class,
+  data = dat, family = binomial()
+)
+
+performance::check_collinearity(mod_no_interaction)
 #print(performance::check_overdispersion(final_model))
 # Influence diagnostics 
 infl <- influence.measures(final_model)
@@ -290,9 +298,16 @@ pred_df <- pred_grid %>%
     hi   = plogis(link + 1.96 * se)
   )
 
+zissou <- wes_palette("Zissou1", 2, type = "continuous")
 p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill = activity_class)) +
+  geom_rug(data = dat,                          # <-- add this
+           aes(x = distance_m, y = NULL),
+           alpha = 0.2, length = unit(0.03, "npc"),
+           inherit.aes = FALSE) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
   geom_line(linewidth = 1) +
+  scale_colour_manual(values = zissou) +
+  scale_fill_manual(values = zissou) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
     x = "Distance (m)",
@@ -300,9 +315,62 @@ p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill =
     title = "Distance–response curve (binary reaction model)",
     subtitle = "95% CI ribbons; other covariates held at reference levels"
   ) +
+  coord_cartesian(xlim = c(0, 4000)) +
   theme_minimal()
 
 print(p_curve)
+
+
+# ---- Model averaging sensitivity check ----
+# Average predictions across models within delta AICc < 2
+
+# Generate predictions from each top model
+avg_preds <- map2_dfr(top_models, top_weights, function(mod, wt) {
+  
+  # Build a prediction grid appropriate for this specific model
+  nd <- pred_grid
+  
+  # If this model uses survey_method, add it at reference level
+  if ("survey_method" %in% all.vars(formula(mod))) {
+    nd <- nd %>%
+      mutate(survey_method = factor(levels(dat$survey_method)[1],
+                                    levels = levels(dat$survey_method)))
+  }
+  pr <- predict(mod, newdata = nd, type = "response")
+  nd %>%
+    mutate(prob = pr, weight = wt)
+}) %>%
+  group_by(distance_m, activity_class) %>%
+  summarise(
+    prob_avg = sum(prob * weight) / sum(weight),
+    .groups = "drop"
+  )
+# Compare top model vs model-averaged predictions
+comparison_df <- pred_df %>%
+  select(distance_m, activity_class, prob_top = prob) %>%
+  left_join(avg_preds, by = c("distance_m", "activity_class"))
+
+ggplot(comparison_df, aes(x = distance_m)) +
+  geom_line(aes(y = prob_top,  colour = activity_class,
+                linetype = "Top model"), linewidth = 0.9) +
+  geom_line(aes(y = prob_avg,  colour = activity_class,
+                linetype = "Model averaged"), linewidth = 0.9) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_linetype_manual(values = c("Top model" = "solid",
+                                   "Model averaged" = "dashed")) +
+  labs(
+    x        = "Distance (m)",
+    y        = "Predicted probability of reaction",
+    colour   = "Activity class",
+    linetype = "Prediction type",
+    title    = "Sensitivity check: top model vs model-averaged predictions",
+    subtitle = "Dashed lines show model-averaged predictions across ΔAICc < 2 set"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
 
 # ---- 6) Poliucy relevant outputs table (805 m and 1610 m) ----
 
