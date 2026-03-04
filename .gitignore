@@ -10,3 +10,4 @@
 *.pdf
 *_cache/
 *_files/
+/plots

@@ -100,7 +100,7 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
       survey_method_raw %in% c("land") ~ "Land",
       survey_method_raw %in% c("sea")  ~ "Sea",
       survey_method_raw %in% c("air")  ~ "Air",
-      survey_method_raw %in% c("hovercraft") ~ "Hovercraft",
+      
       TRUE ~ NA_character_
     ) %>% factor()
   )
@@ -110,6 +110,7 @@ dat <- pb %>%
   filter(
     confirmed == "yes",
     resighting == "N", hazing == "N",  #added to filter out resightings and hazing events as per Kate's suggestion
+    survey_method!= "hovercraft",
     !is.na(distance_m), distance_m > 0,
     !is.na(response),
     !is.na(activity_class),
@@ -257,8 +258,7 @@ ggplot(roc_df, aes(x = fpr, y = tpr)) +
                      expand = c(0.01, 0.01)) +
   labs(
     x     = "False positive rate (1 − Specificity)",
-    y     = "True positive rate (Sensitivity)",
-    title = "ROC Curve — binary reaction model"
+    y     = "True positive rate (Sensitivity)"
   ) +
   theme_minimal() +
   theme(
@@ -311,9 +311,8 @@ p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill =
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
     x = "Distance (m)",
-    y = "Predicted probability of behavioural reaction",
-    title = "Distance–response curve (binary reaction model)",
-    subtitle = "95% CI ribbons; other covariates held at reference levels"
+    y = "Predicted probability of behavioural reaction"
+    
   ) +
   coord_cartesian(xlim = c(0, 4000)) +
   theme_minimal()
@@ -362,9 +361,8 @@ ggplot(comparison_df, aes(x = distance_m)) +
     x        = "Distance (m)",
     y        = "Predicted probability of reaction",
     colour   = "Activity class",
-    linetype = "Prediction type",
-    title    = "Sensitivity check: top model vs model-averaged predictions",
-    subtitle = "Dashed lines show model-averaged predictions across ΔAICc < 2 set"
+    linetype = "Prediction type"
+    
   ) +
   theme_minimal() +
   theme(
@@ -785,32 +783,75 @@ boot_long <- boot_draws %>%
   tidyr::unnest_longer(draws) %>%
   filter(!is.na(draws), draws < max(dat$distance_m) * 5)
 
-p_boot <- ggplot(boot_long, aes(x = draws / 1000, fill = activity_class)) +
-  geom_histogram(aes(y = after_stat(density)),
-                 bins = 60, alpha = 0.7, colour = NA,
-                 position = "identity") +
+
+# Cap draws at a sensible distance for visualisation
+# Use 99th percentile per panel rather than the full max
+cap_df <- boot_long %>%
+  group_by(activity_class, target_label) %>%
+  mutate(cap = quantile(draws, 0.95, na.rm = TRUE)) %>%
+  filter(draws <= cap) %>%
+  ungroup()
+
+# Annotation dataframe - convert to metres for labels
+thresh_labels <- dist_thresh_pretty %>%
+  mutate(
+    target_label   = paste0("Target: ", target),
+    activity_class = activity_class,
+    label = case_when(
+      is.na(estimate_m) ~ paste0("Estimate: NA\n95% CI: ", 
+                                 scales::comma(ci_lo_m), "–", 
+                                 scales::comma(ci_hi_m), " m"),
+      TRUE              ~ paste0("Estimate: ", scales::comma(estimate_m), " m\n95% CI: ", 
+                                 scales::comma(ci_lo_m), "–", 
+                                 scales::comma(ci_hi_m), " m")
+    )
+  )
+
+# Median lines dataframe
+median_lines <- dist_thresh_pretty %>%
+  mutate(target_label = paste0("Target: ", target)) %>%
+  filter(!is.na(estimate_m)) %>%
+  select(activity_class, target_label, median_m = estimate_m)
+
+p_boot <- ggplot(cap_df, aes(x = draws, fill = activity_class)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))),
+                 bins = 50, alpha = 0.8, colour = NA) +
   geom_vline(
-    data = boot_long %>%
-      group_by(activity_class, target_label) %>%
-      summarise(median_km = median(draws / 1000, na.rm = TRUE), .groups = "drop"),
-    aes(xintercept = median_km, colour = activity_class),
-    linetype = "dashed", linewidth = 0.8
+    data = median_lines,
+    aes(xintercept = median_m, colour = activity_class),
+    linetype = "dashed", linewidth = 0.9
   ) +
-  facet_grid(activity_class ~ target_label, scales = "free_x") +
-  scale_x_continuous(name = "Threshold distance (km)") +
-  scale_y_continuous(name = "Density") +
-  labs(
-    title    = "Bootstrap distribution of distance thresholds",
-    subtitle = "Dashed lines show median; distributions reflect full parametric uncertainty in model coefficients"
+  geom_text(
+    data = thresh_labels,
+    aes(label = label),
+    x = Inf, y = Inf,
+    hjust = 1.1, vjust = 1.4,
+    size = 3, colour = "grey20",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ activity_class + target_label, 
+             scales = "free_x",
+             nrow = 2) +
+  scale_colour_manual(values = zissou) +
+  scale_fill_manual(values = zissou) +
+  scale_x_continuous(
+    name   = "Threshold distance (m)",
+    labels = scales::comma
+  ) +
+  scale_y_continuous(
+    name   = "Proportion of bootstrap draws",
+    labels = scales::percent_format(accuracy = 1)
   ) +
   theme_minimal() +
   theme(
-    legend.position    = "none",
-    panel.grid.minor   = element_blank(),
-    strip.text         = element_text(face = "bold"),
-    plot.title         = element_text(face = "bold")
+    legend.position  = "none",
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10),
+    plot.title       = element_text(face = "bold"),
+    panel.spacing    = unit(1.2, "lines")
   )
 
 print(p_boot)
+
 
 
