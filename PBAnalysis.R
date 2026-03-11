@@ -32,6 +32,7 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
     response_type_raw = str_to_lower(str_trim(behavior_change_response)),
     resighting = resighting_y_n_p,
     hazing = hazing_y_or_n,
+    remove = remove,
     
     # activity
     activity2_raw = str_to_lower(str_trim(activity2)),
@@ -98,7 +99,7 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
     # survey method (mostly Land, but keep if you want to test)
     survey_method = case_when(
       survey_method_raw %in% c("land") ~ "Land",
-      survey_method_raw %in% c("sea")  ~ "Sea",
+      survey_method_raw %in% c("sea", "hovercraft")  ~ "Sea",
       survey_method_raw %in% c("air")  ~ "Air",
       
       TRUE ~ NA_character_
@@ -108,15 +109,18 @@ pb <- readr::read_csv(data_path, show_col_types = FALSE) %>%
 # ---- 2) Analysis dataset (core binary model) ----
 dat <- pb %>%
   filter(
+    distance_m >0,
     confirmed == "yes",
-    resighting == "N", hazing == "N",  #added to filter out resightings and hazing events as per Kate's suggestion
-    survey_method!= "hovercraft",
-    !is.na(distance_m), distance_m > 0,
+    resighting == "N", hazing == "N", remove=="N",  #added to filter out resightings and hazing events as per Kate's suggestion
+    !is.na(distance_m), 
     !is.na(response),
     !is.na(activity_class),
     !is.na(season),
-    !is.na(group_comp)
+    !is.na(group_comp),
+    !is.na(survey_method)
+    
   )
+
 
 dat %>%
   summarise(
