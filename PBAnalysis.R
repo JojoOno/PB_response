@@ -557,7 +557,7 @@ write_csv(dist_thresh_pretty, "results/distance_thresholds_pretty.csv")
 # ---- 7) Save outputs ----
 dir.create("results", showWarnings = FALSE)
 write_csv(mgmt_tbl, "results/management_probs_805_1610.csv")
-write_csv(as_tibble(sel), "results/model_selection_candidate_set.csv")
+write_csv(as_tibble(sel_tbl), "results/model_selection_candidate_set.csv")
 ggsave("results/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
 writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
 
