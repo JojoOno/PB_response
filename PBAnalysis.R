@@ -249,7 +249,7 @@ roc_df <- data.frame(
 
 auc_label <- paste0("AUC = ", round(as.numeric(pROC::auc(roc_obj)), 3))
 
-ggplot(roc_df, aes(x = fpr, y = tpr)) +
+auc_curve <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
   geom_ribbon(aes(ymin = 0, ymax = tpr), fill = "#2c7bb6", alpha = 0.15) +
   geom_line(colour = "#2c7bb6", linewidth = 1) +
   geom_abline(slope = 1, intercept = 0,
@@ -261,14 +261,16 @@ ggplot(roc_df, aes(x = fpr, y = tpr)) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1),
                      expand = c(0.01, 0.01)) +
   labs(
-    x     = "False positive rate (1 − Specificity)",
-    y     = "True positive rate (Sensitivity)"
+    x     = "False positive rate",
+    y     = "True positive rate"
   ) +
   theme_minimal() +
   theme(
     panel.grid.minor = element_blank(),
     plot.title = element_text(face = "bold")
   )
+
+print(auc_curve)
 
 # ---- 5) Prediction curve (distance-response) ----
 make_pred_grid <- function(dat, season_ref = "open_water", group_ref = "no_cubs", survey_ref = NULL) {
@@ -305,9 +307,8 @@ pred_df <- pred_grid %>%
 zissou <- wes_palette("Zissou1", 2, type = "continuous")
 p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill = activity_class)) +
   geom_rug(data = dat,                          # <-- add this
-           aes(x = distance_m, y = NULL),
-           alpha = 0.2, length = unit(0.03, "npc"),
-           inherit.aes = FALSE) +
+           aes(x = distance_m, y = NULL, colour=activity_class),
+           alpha = 0.2, length = unit(0.03, "npc"), show.legend = FALSE) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
   geom_line(linewidth = 1) +
   scale_colour_manual(values = zissou) +
@@ -315,10 +316,12 @@ p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill =
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
     x = "Distance (m)",
-    y = "Predicted probability of behavioural reaction"
+    y = "Predicted probability of behavioural reaction",
+    colour = "Activity class",
+    fill   = "Activity class"
     
   ) +
-  coord_cartesian(xlim = c(0, 4000)) +
+  coord_cartesian(xlim = c(0, max(pred_df$distance_m))) +
   theme_minimal()
 
 print(p_curve)
@@ -558,9 +561,11 @@ write_csv(dist_thresh_pretty, "results/distance_thresholds_pretty.csv")
 dir.create("results", showWarnings = FALSE)
 write_csv(mgmt_tbl, "results/management_probs_805_1610.csv")
 write_csv(as_tibble(sel_tbl), "results/model_selection_candidate_set.csv")
-ggsave("results/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
 writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
 
+dir.create("plots", showWarnings = FALSE)
+ggsave("plots/pred_curve.png", p_curve, width = 9, height = 5, dpi = 300)
+ggsave("plots/auc_curve.png", auc_curve, width = 9, height = 5, dpi = 300)
 
 # ---- PLAYING WITH PLOTS ----
 # ---- Calibration Plot ----
@@ -857,5 +862,6 @@ p_boot <- ggplot(cap_df, aes(x = draws, fill = activity_class)) +
 
 print(p_boot)
 
+ggsave("plots/bootstraps-dist.png", p_boot, width = 9, height = 5, dpi = 300)
 
 
