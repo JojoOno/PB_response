@@ -598,10 +598,7 @@ p_cal <- ggplot(cal_df, aes(x = mean_predicted, y = mean_observed)) +
   scale_size_continuous(name = "N observations", range = c(2, 8)) +
   labs(
     x        = "Mean predicted probability",
-    y        = "Observed reaction rate",
-    title    = "Model calibration plot",
-    subtitle = "Points sized by number of observations per bin; error bars show 95% CI on observed rate"
-  ) +
+    y        = "Observed reaction rate") +
   theme_minimal() +
   theme(
     panel.grid.minor = element_blank(),
