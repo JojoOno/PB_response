@@ -16,6 +16,8 @@ library(DHARMa)
 library(pROC)
 library(scales)
 library(wesanderson)
+library(kableExtra)
+library(flextable)
 
 set.seed(123)
 
@@ -206,6 +208,39 @@ top_weights <- sel_tbl %>% filter(delta < 2) %>% pull(weight)
 cat("\nTop set (ΔAICc < 2):\n")
 print(sel_tbl %>% filter(delta < 2))
 
+model_labels <- c(
+  "act.spl_act"       = "Spline(distance) × activity class",
+  "core.spl_core"     = "Spline(distance) × activity class + season × group composition",
+  "act.log_act"       = "Log(distance) × activity class",
+  "survey.spl_survey" = "Spline(distance) × activity class + season × group composition + survey method",
+  "core.log_core"     = "Log(distance) × activity class + season × group composition",
+  "survey.log_survey" = "Log(distance) × activity class + season × group composition + survey method",
+  "act.lin_act"       = "Linear(distance) × activity class",
+  "core.lin_core"     = "Linear(distance) × activity class + season × group composition",
+  "survey.lin_survey" = "Linear(distance) × activity class + season × group composition + survey method",
+  "base.spl_base"     = "Spline(distance)",
+  "base.log_base"     = "Log(distance)",
+  "base.lin_base"     = "Linear(distance)"
+)
+
+sel_tbl %>%
+  mutate(
+    model  = model_labels[model],
+    AIC    = round(AIC, 3),
+    AICc   = round(AICc, 3),
+    delta  = round(delta, 3),
+    weight = round(weight, 3)
+  ) %>%
+  select(model, k, AIC, AICc, delta, weight) %>%
+  knitr::kable(
+    format    = "html",
+    col.names = c("Model", "k", "AIC", "AICc", "\u0394AICc", "Weight"),
+    caption   = "AICc model selection table. Models within \u0394AICc < 2 shown in bold."
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  kableExtra::save_kable("results/model_selection_table.html")
+
+
 # ---- 4) Model Diagnostics ----
 print(performance::check_collinearity(final_model))
 # Fit main effects only version to check underlying collinearity as interaction terms are high
@@ -305,25 +340,32 @@ pred_df <- pred_grid %>%
   )
 
 zissou <- wes_palette("Zissou1", 2, type = "continuous")
+pred_df <- pred_df %>%
+  mutate(activity_class = factor(activity_class, levels = c("mobile", "stationary")))
+
 p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill = activity_class)) +
-  geom_rug(data = dat,                          # <-- add this
-           aes(x = distance_m, y = NULL, colour=activity_class),
-           alpha = 0.2, length = unit(0.03, "npc"), show.legend = FALSE) +
+  geom_rug(data = dat,
+           aes(x = distance_m, colour = activity_class),
+           alpha = 0.35, length = unit(0.03, "npc"), 
+           show.legend = FALSE,
+           inherit.aes = FALSE) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
   geom_line(linewidth = 1) +
-  scale_colour_manual(values = zissou) +
-  scale_fill_manual(values = zissou) +
+  scale_colour_manual(values = c("mobile" = zissou[2], "stationary" = zissou[1]),
+                      breaks = c("mobile", "stationary")) +
+  scale_fill_manual(values = c("mobile" = zissou[2], "stationary" = zissou[1]),
+                    breaks = c("mobile", "stationary")) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
-    x = "Distance (m)",
-    y = "Predicted probability of behavioural reaction",
+    x      = "Distance (m)",
+    y      = "Predicted probability of behavioural reaction",
     colour = "Activity class",
-    fill   = "Activity class"
-    
-  ) +
-  coord_cartesian(xlim = c(0, max(pred_df$distance_m))) +
-  theme_minimal()
-
+    fill   = "Activity class"  ) +
+  coord_cartesian(xlim = c(0, 2000), ylim = c(0, 0.40)) +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(size = 9, colour = "grey40", hjust = 0)
+  )
 print(p_curve)
 
 
