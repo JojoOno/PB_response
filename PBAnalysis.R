@@ -344,10 +344,17 @@ pred_df <- pred_df %>%
   mutate(activity_class = factor(activity_class, levels = c("mobile", "stationary")))
 
 p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill = activity_class)) +
-  geom_rug(data = dat,
-           aes(x = distance_m, colour = activity_class),
-           alpha = 0.35, length = unit(0.03, "npc"), 
-           show.legend = FALSE,
+  geom_rug(data = filter(dat, activity_class == "mobile"),
+           aes(x = distance_m),
+           colour = zissou[2],
+           alpha = 0.35, length = unit(0.03, "npc"),
+           sides = "b",
+           inherit.aes = FALSE) +
+  geom_rug(data = filter(dat, activity_class == "stationary"),
+           aes(x = distance_m),
+           colour = zissou[1],
+           alpha = 0.35, length = unit(0.015, "npc"),
+           sides = "b",
            inherit.aes = FALSE) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
   geom_line(linewidth = 1) +
@@ -358,9 +365,9 @@ p_curve <- ggplot(pred_df, aes(distance_m, prob, colour = activity_class, fill =
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
     x      = "Distance (m)",
-    y      = "Predicted probability of behavioural reaction",
-    colour = "Activity class",
-    fill   = "Activity class"  ) +
+    y      = "Predicted probability of behavioral reaction",
+    colour = "Activity type",
+    fill   = "Activity type") +
   coord_cartesian(xlim = c(0, 2000), ylim = c(0, 0.40)) +
   theme_minimal() +
   theme(
